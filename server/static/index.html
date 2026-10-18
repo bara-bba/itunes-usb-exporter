@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>USB Exporter</title>
+<style>
+  :root {
+    --ink: #0B0B0B; --panel: #121211; --line: #E8E8E2; --dim: #8C8C86; --faint: #5A5A55;
+    --edge: #3A3A36; --hair: #2A2A28; --lime: #C8F53C; --orange: #E8A33A; --red: #FF2B1C;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--ink); color: var(--line); font: 14px/1.4 Arial, "Liberation Sans", sans-serif; }
+  header { display: flex; align-items: baseline; gap: 14px; padding: 16px 20px 10px; border-bottom: 1px solid var(--hair); }
+  h1 { margin: 0; font-weight: normal; font-size: 30px; color: var(--lime); letter-spacing: .5px; }
+  .section { color: var(--dim); font-size: 11px; font-weight: bold; letter-spacing: 1px; text-transform: uppercase; }
+  main { display: grid; grid-template-columns: 1fr 300px; gap: 20px; padding: 16px 20px; }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; } aside { order: -1; } }
+  table { width: 100%; border-collapse: collapse; border: 1px solid var(--hair); }
+  th { text-align: left; color: var(--dim); font-size: 11px; letter-spacing: 1px; padding: 8px; border-bottom: 1px solid var(--hair); }
+  td { padding: 7px 8px; border-bottom: 1px solid #161615; }
+  td.num, th.num { text-align: right; }
+  tr.row { cursor: pointer; }
+  tr.row:hover td { background: var(--panel); }
+  .in-sync { color: var(--lime); } .differs { color: var(--orange); } .only { color: var(--faint); }
+  .warn { color: var(--orange); font-size: 12px; }
+  input[type=checkbox] { accent-color: var(--lime); width: 15px; height: 15px; vertical-align: middle; }
+  .box { border: 1px solid var(--hair); padding: 12px; margin-bottom: 16px; }
+  .drive-name { font-size: 18px; margin: 4px 0; }
+  .muted { color: var(--dim); font-size: 12px; }
+  button { background: var(--ink); color: var(--dim); border: 1px solid var(--edge); padding: 7px 14px;
+           font: bold 11px Arial, sans-serif; letter-spacing: 1px; text-transform: uppercase; cursor: pointer; }
+  button:hover:not(:disabled) { color: var(--line); border-color: var(--line); }
+  button:active:not(:disabled) { background: var(--lime); color: var(--ink); border-color: var(--lime); }
+  button:disabled { color: var(--faint); border-color: var(--hair); cursor: default; }
+  button.accent { color: var(--lime); border-color: var(--lime); font-size: 14px; padding: 10px 22px; width: 100%; }
+  button.accent:hover:not(:disabled) { background: var(--lime); color: var(--ink); }
+  label.opt { display: block; margin: 8px 0; color: var(--line); }
+  .bar { height: 4px; background: var(--panel); margin: 10px 0; }
+  .bar > div { height: 100%; width: 0; background: var(--lime); transition: width .2s; }
+  pre { background: var(--panel); color: var(--dim); border: 1px solid var(--hair); padding: 8px 10px;
+        height: 170px; overflow: auto; margin: 0; font: 12px Consolas, "DejaVu Sans Mono", monospace; white-space: pre-wrap; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>NAS &rarr; USB</h1>
+  <span class="section">Playlist exporter</span>
+</header>
+<main>
+  <section>
+    <table>
+      <thead><tr><th style="width:32px"></th><th>PLAYLIST</th><th class="num">SONGS</th><th>ON DRIVE</th><th>DIFFERENCES</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="5" class="muted">Loading&hellip;</td></tr></tbody>
+    </table>
+    <div class="toolbar">
+      <button id="all">Select all</button>
+      <button id="none">Select none</button>
+      <span id="count" class="muted"></span>
+    </div>
+    <div class="bar"><div id="bar"></div></div>
+    <pre id="log"></pre>
+  </section>
+  <aside>
+    <div class="box">
+      <div class="section">USB drive</div>
+      <div id="drive" class="drive-name">&hellip;</div>
+      <div id="driveinfo" class="muted"></div>
+      <div class="toolbar"><button id="eject">Eject</button></div>
+    </div>
+    <div class="box">
+      <div class="section">Options</div>
+      <label class="opt"><input type="checkbox" id="remove"> Remove playlists on the drive that are not ticked</label>
+      <label class="opt"><input type="checkbox" id="prune"> Delete songs no playlist on the drive uses any more</label>
+    </div>
+    <button id="export" class="accent">Export</button>
+    <p class="muted" id="source"></p>
+  </aside>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let data = null, selected = new Set(), preselected = false, wasMounted = false, polling = null;
+
+function gb(n) { return n >= 2 ** 30 ? (n / 2 ** 30).toFixed(1) + ' GB' : Math.round(n / 2 ** 20) + ' MB'; }
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c])); }
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+function render() {
+  const d = data.drive, mounted = d.state === 'mounted';
+  if (mounted && !wasMounted) preselected = false;   // a new drive: preselect its playlists again
+  wasMounted = mounted;
+  if (mounted && !preselected) {
+    selected = new Set(data.playlists.filter(p => p.state && p.state !== 'not on drive').map(p => p.name));
+    preselected = true;
+  }
+  const names = new Set(data.playlists.map(p => p.name));
+  selected = new Set([...selected].filter(n => names.has(n)));
+
+  $('drive').textContent = mounted ? (d.label || 'USB drive') : ({ejected: 'Safe to remove', error: 'Drive not readable'}[d.state] || 'Insert a USB drive');
+  $('drive').style.color = mounted ? 'var(--lime)' : (d.state === 'ejected' ? 'var(--line)' : 'var(--dim)');
+  $('driveinfo').textContent = mounted ? `${gb(d.free)} free of ${gb(d.total)} · ${d.fstype}` : (d.state === 'ejected' ? 'You can unplug it now.' : 'Plug it into the server\'s front USB port.');
+
+  const rows = data.playlists.map(p => {
+    const cls = p.state === 'in sync' ? 'in-sync' : p.state === 'differs' ? 'differs' : '';
+    const warn = p.missing_count ? `<div class="warn" title="${esc(p.missing.join('\n'))}">${p.missing_count} not found on the NAS</div>` : '';
+    return `<tr class="row ${cls}" data-name="${esc(p.name)}"><td><input type="checkbox" ${selected.has(p.name) ? 'checked' : ''}></td>` +
+           `<td>${esc(p.name)}</td><td class="num">${p.songs}</td><td>${esc(p.state || '–')}</td><td>${esc(p.detail)}${warn}</td></tr>`;
+  });
+  rows.push(...data.only_on_drive.map(p =>
+    `<tr class="only"><td></td><td>${esc(p.name)}</td><td class="num">${p.songs}</td><td>only on drive</td><td>not on the NAS</td></tr>`));
+  $('rows').innerHTML = rows.join('') || '<tr><td colspan="5" class="muted">No playlists found in ' + esc(data.source) + '</td></tr>';
+  document.querySelectorAll('tr.row').forEach(tr => tr.onclick = e => {
+    const n = tr.dataset.name;
+    selected.has(n) ? selected.delete(n) : selected.add(n);
+    if (e.target.type !== 'checkbox') tr.querySelector('input').checked = selected.has(n);
+    count();
+  });
+  count();
+  renderJob(data.job);
+  $('source').textContent = 'Playlists: ' + data.source;
+}
+
+function count() {
+  const songs = data.playlists.filter(p => selected.has(p.name)).reduce((a, p) => a + p.songs, 0);
+  $('count').textContent = `${selected.size} of ${data.playlists.length} playlists ticked, ${songs} songs`;
+}
+
+function renderJob(j) {
+  const mounted = data && data.drive.state === 'mounted';
+  $('export').disabled = j.running || !mounted;
+  $('eject').disabled = j.running || !mounted;
+  $('export').textContent = j.running ? `Exporting ${j.done} / ${j.total}` : 'Export';
+  $('bar').style.width = j.total ? (100 * j.done / j.total) + '%' : (j.summary ? '100%' : '0');
+  const log = $('log'), atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+  log.textContent = j.log.join('\n');
+  if (atEnd) log.scrollTop = log.scrollHeight;
+}
+
+async function refresh() {
+  try { data = await api('/api/state'); render(); } catch (e) { $('log').textContent = 'Server not reachable: ' + e.message; }
+}
+
+async function watchJob() {
+  const j = await api('/api/job');
+  renderJob(j);
+  if (j.running) { setTimeout(watchJob, 500); } else { refresh(); }
+}
+
+$('all').onclick = () => { data.playlists.forEach(p => selected.add(p.name)); render(); };
+$('none').onclick = () => { selected.clear(); render(); };
+$('export').onclick = async () => {
+  const del = [];
+  if ($('remove').checked) del.push('playlists that are not ticked');
+  if ($('prune').checked) del.push('songs no playlist uses');
+  if (!selected.size && !$('remove').checked) return alert('Tick at least one playlist.');
+  if (del.length && !confirm('This will delete ' + del.join(' and ') + ' on the USB drive. Continue?')) return;
+  try {
+    await api('/api/export', {names: [...selected], remove_others: $('remove').checked, prune: $('prune').checked});
+    watchJob();
+  } catch (e) { alert(e.message); }
+};
+$('eject').onclick = async () => {
+  $('eject').disabled = true; $('eject').textContent = 'Ejecting…';
+  try { await api('/api/eject', {}); } catch (e) { alert(e.message); }
+  $('eject').textContent = 'Eject';
+  refresh();
+};
+
+refresh().then(() => { if (data && data.job.running) watchJob(); });
+setInterval(() => { if (!data || !data.job.running) refresh(); }, 4000);
+</script>
+</body>
+</html>

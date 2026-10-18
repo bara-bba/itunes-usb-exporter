@@ -104,6 +104,104 @@ def load_playlists(library_path=DEFAULT_LIBRARY, source_root=DEFAULT_SOURCE_ROOT
     return out
 
 
+def read_text(path):
+    with open(path, 'rb') as fh:
+        raw = fh.read()
+    try:
+        return raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        return raw.decode('latin-1')
+
+
+def parse_path_map(spec):
+    """'Z:\\=/mnt/music;\\\\truenas\\media\\music=/mnt/music' -> [(prefix, target)], longest first."""
+    pairs = []
+    for item in (spec or '').split(';'):
+        if '=' in item:
+            prefix, target = item.split('=', 1)
+            if prefix.strip():
+                pairs.append((prefix.strip(), target.strip()))
+    return sorted(pairs, key=lambda p: -len(p[0]))
+
+
+def map_playlist_line(line, playlist_dir, path_map):
+    """A path from an .m3u line -> local path, or None if it's a Windows path no prefix maps."""
+    if line.startswith('file://'):
+        line = unquote(urlparse(line).path)
+    for prefix, target in path_map:
+        if line.lower().startswith(prefix.lower()):
+            rest = line[len(prefix):].replace('\\', '/').lstrip('/')
+            return os.path.normpath(os.path.join(target, rest))
+    if re.match(r'^[A-Za-z]:[\\/]', line) or line.startswith('\\\\'):
+        return None
+    line = line.replace('\\', '/')
+    return os.path.normpath(line if os.path.isabs(line) else os.path.join(playlist_dir, line))
+
+
+_dir_cache = {}
+
+
+def resolve_case(path):
+    """The real path when only letter case differs (the playlists were made on
+    case-insensitive Windows/SMB; the server's filesystem is case-sensitive)."""
+    if os.path.exists(path):
+        return path
+    parts = os.path.normpath(path).split(os.sep)
+    cur = os.sep if path.startswith(os.sep) else ''
+    for part in parts:
+        if not part:
+            continue
+        nxt = os.path.join(cur, part)
+        if not os.path.exists(nxt):
+            if cur not in _dir_cache:
+                try:
+                    _dir_cache[cur] = {n.lower(): n for n in os.listdir(cur or '.')}
+                except OSError:
+                    return None
+            real = _dir_cache[cur].get(part.lower())
+            if real is None:
+                return None
+            nxt = os.path.join(cur, real)
+        cur = nxt
+    return cur
+
+
+def load_m3u_playlists(playlist_dir, source_root, path_map=(), check_files=True):
+    """Playlists from a folder of .m3u/.m3u8 files (e.g. exported from iTunes onto the NAS)."""
+    _dir_cache.clear()
+    out = []
+    if not os.path.isdir(playlist_dir):
+        return out
+    seen = set()
+    for f in sorted(os.listdir(playlist_dir)):
+        stem, ext = os.path.splitext(f)
+        name = clean(stem, 'Playlist')
+        if ext.lower() not in PLAYLIST_EXT or name in seen:
+            continue
+        seen.add(name)
+        songs, missing, extinf = [], [], None
+        for raw in read_text(os.path.join(playlist_dir, f)).splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith('#EXTINF'):
+                extinf = line
+                continue
+            if line.startswith('#'):
+                continue
+            src = map_playlist_line(line, playlist_dir, path_map)
+            if src is not None and check_files:
+                src = resolve_case(src)
+            if src is None or (check_files and not os.path.isfile(src)):
+                missing.append(line)
+            else:
+                songs.append(Song(src, drive_relpath({}, src, source_root),
+                                  extinf or f'#EXTINF:-1,{os.path.splitext(os.path.basename(src))[0]}'))
+            extinf = None
+        out.append(Playlist(name, songs, missing))
+    return out
+
+
 def drive_playlists(drive):
     """{name: [playlist lines]} for the playlist files already on a drive."""
     root = os.path.join(drive, PLAYLIST_DIR)
@@ -114,12 +212,7 @@ def drive_playlists(drive):
         stem, ext = os.path.splitext(f)
         if ext.lower() not in PLAYLIST_EXT or stem in out:
             continue
-        with open(os.path.join(root, f), 'rb') as fh:
-            raw = fh.read()
-        try:
-            text = raw.decode('utf-8-sig')
-        except UnicodeDecodeError:
-            text = raw.decode('latin-1')
+        text = read_text(os.path.join(root, f))
         out[stem] = [l.strip().replace('\\', '/') for l in text.splitlines()
                      if l.strip() and not l.startswith('#')]
     return out
