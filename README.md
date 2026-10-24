@@ -51,6 +51,23 @@ The page's titles use the TAN Spring font if `/etc/usb-exporter/fonts/TAN-SPRING
 exists in the container (Arial otherwise). The font is commercial, so it's not in
 this repo: copy your own licensed file there.
 
+## Export for Mixxx, Traktor or other players
+
+Under the playlist table, **Export for** picks the software (several at once;
+remembered per browser). The songs are copied once to `Music/` either way.
+
+| Target | Written on the drive | Use |
+|---|---|---|
+| Mixxx (Pi) | `Playlists/<name>.m3u8` | the push-mixxx Pi imports them automatically |
+| Traktor | `Traktor/Exporter USB.nml` | Traktor: Playlists > right-click > Import Playlist > this file, once: every playlist arrives in an "Exporter USB" folder |
+| Other players | `M3U/<name>.m3u` | any player or DJ app that imports M3U |
+
+Traktor stores where a song is with the drive's name on macOS and its letter on
+Windows, so pick **on Mac** or **on Windows, drive E** (the letter the stick gets
+on that PC). BPM, grids and cues analysed in Traktor stay in Traktor's own
+collection on the laptop. The "on drive" states on the page compare against the
+Mixxx playlists. Command line: `--for mixxx,traktor,m3u --traktor-os windows --traktor-drive E`.
+
 ## Repos, releases and auto-deploy
 
 Developed on Gitea (`http://192.168.42.73:3000/bara-bba/itunes-usb-exporter`);

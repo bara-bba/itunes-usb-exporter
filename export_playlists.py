@@ -202,9 +202,9 @@ def load_m3u_playlists(playlist_dir, source_root, path_map=(), check_files=True)
     return out
 
 
-def drive_playlists(drive):
+def drive_playlists(drive, folder=PLAYLIST_DIR):
     """{name: [playlist lines]} for the playlist files already on a drive."""
-    root = os.path.join(drive, PLAYLIST_DIR)
+    root = os.path.join(drive, folder)
     out = {}
     if not os.path.isdir(root):
         return out
@@ -260,25 +260,18 @@ def bytes_to_copy(drive, playlists):
     return total
 
 
-def export(drive, playlists, remove_others=False, prune=False, log=print, progress=None):
-    """Copies the songs and writes the playlist files for `playlists` onto `drive`.
-    remove_others: delete playlist files on the drive not in `playlists`.
-    prune: delete songs under Music/ that no playlist file left on the drive uses.
-    progress(done, total) is called after each song. Returns a summary string."""
+TARGETS = ('mixxx', 'traktor', 'm3u')
+GENERIC_DIR = 'M3U'                 # generic .m3u playlists (any player)
+TRAKTOR_DIR = 'Traktor'             # one .nml with every exported playlist
+TRAKTOR_FILE = 'Exporter USB.nml'
+TRAKTOR_FOLDER = 'Exporter USB'     # playlist folder Traktor shows after the import
+
+
+def _copy_songs(drive, playlists, log, progress):
     music_root = os.path.join(drive, MUSIC_DIR)
-    playlist_root = os.path.join(drive, PLAYLIST_DIR)
-    os.makedirs(playlist_root, exist_ok=True)
-
-    need = bytes_to_copy(drive, playlists)
-    free = shutil.disk_usage(drive).free
-    if need > free:
-        raise OSError(f'not enough space on {drive}: needs {need >> 20} MB, {free >> 20} MB free')
-
     total = sum(len(pl.songs) for pl in playlists)
     done = copied = 0
-    written = set()
     for pl in playlists:
-        lines = ['#EXTM3U']
         for s in pl.songs:
             dst = os.path.join(music_root, s.rel)
             if not (os.path.isfile(dst) and os.path.getsize(dst) == os.path.getsize(s.src)):
@@ -286,29 +279,119 @@ def export(drive, playlists, remove_others=False, prune=False, log=print, progre
                 log(f'copy  {s.rel}')
                 shutil.copyfile(s.src, dst)
                 copied += 1
-            lines += [s.extinf, s.line]
             done += 1
             if progress:
                 progress(done, total)
-        path = os.path.join(playlist_root, pl.name + '.m3u8')
+    return copied
+
+
+def _write_m3u_dir(drive, playlists, folder, ext, remove_others, log):
+    """Playlists as .m3u8 (Mixxx) or .m3u (generic), paths relative to the playlist file."""
+    root = os.path.join(drive, folder)
+    os.makedirs(root, exist_ok=True)
+    written = set()
+    for pl in playlists:
+        lines = ['#EXTM3U']
+        for s in pl.songs:
+            lines += [s.extinf, s.line]
+        path = os.path.join(root, pl.name + ext)
         with open(path, 'w', encoding='utf-8', newline='\n') as f:
             f.write('\n'.join(lines) + '\n')
         written.add(os.path.normcase(path))
-        log(f'playlist  {pl.name}  ({len(pl.songs)} songs)')
-
     removed = 0
     if remove_others:
-        for f in os.listdir(playlist_root):
-            path = os.path.join(playlist_root, f)
+        for f in os.listdir(root):
+            path = os.path.join(root, f)
             if f.lower().endswith(PLAYLIST_EXT) and os.path.normcase(path) not in written:
-                log(f'remove playlist  {f}')
+                log(f'remove playlist  {folder}/{f}')
                 os.remove(path)
                 removed += 1
+    return removed
+
+
+def _xml(s):
+    return (str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            .replace('"', '&quot;'))
+
+
+def traktor_volume(platform, label, letter=''):
+    """How Traktor names the drive in its paths: the drive letter on Windows
+    ('E:'), the volume name on macOS."""
+    if platform == 'windows':
+        letter = (letter or 'E').strip().rstrip(':\\/').upper()[:1] or 'E'
+        return letter + ':'
+    return label or 'USB'
+
+
+def write_traktor_nml(drive, playlists, volume):
+    """One Traktor .nml holding every playlist in a folder: in Traktor,
+    Playlists > Import Playlist > this file brings them all in at once."""
+    import uuid
+    entries, keys = {}, []
+    for pl in playlists:
+        pk = []
+        for s in pl.songs:
+            parts = [MUSIC_DIR] + s.rel.replace('\\', '/').split('/')
+            d = '/:' + '/:'.join(parts[:-1]) + '/:'
+            key = volume + d + parts[-1]
+            if key not in entries:
+                info = s.extinf.split(',', 1)[1] if ',' in s.extinf else parts[-1]
+                artist, _, title = info.partition(' - ') if ' - ' in info else ('', '', info)
+                entries[key] = (f'<ENTRY TITLE="{_xml(title)}" ARTIST="{_xml(artist)}">'
+                                f'<LOCATION DIR="{_xml(d)}" FILE="{_xml(parts[-1])}" VOLUME="{_xml(volume)}" '
+                                f'VOLUMEID="{_xml(volume)}"></LOCATION></ENTRY>')
+            pk.append(key)
+        keys.append((pl.name, pk))
+    nodes = ''.join(
+        f'<NODE TYPE="PLAYLIST" NAME="{_xml(name)}"><PLAYLIST ENTRIES="{len(pk)}" TYPE="LIST" UUID="{uuid.uuid4().hex}">'
+        + ''.join(f'<ENTRY><PRIMARYKEY TYPE="TRACK" KEY="{_xml(k)}"></PRIMARYKEY></ENTRY>' for k in pk)
+        + '</PLAYLIST></NODE>' for name, pk in keys)
+    nml = ('<?xml version="1.0" encoding="UTF-8" standalone="no" ?>\n'
+           '<NML VERSION="19"><HEAD COMPANY="www.native-instruments.com" PROGRAM="Traktor"></HEAD>'
+           f'<COLLECTION ENTRIES="{len(entries)}">' + ''.join(entries.values()) + '</COLLECTION>'
+           '<PLAYLISTS><NODE TYPE="FOLDER" NAME="$ROOT"><SUBNODES COUNT="1">'
+           f'<NODE TYPE="FOLDER" NAME="{_xml(TRAKTOR_FOLDER)}"><SUBNODES COUNT="{len(keys)}">{nodes}</SUBNODES></NODE>'
+           '</SUBNODES></NODE></PLAYLISTS></NML>\n')
+    root = os.path.join(drive, TRAKTOR_DIR)
+    os.makedirs(root, exist_ok=True)
+    with open(os.path.join(root, TRAKTOR_FILE), 'w', encoding='utf-8', newline='\n') as f:
+        f.write(nml)
+
+
+def export(drive, playlists, remove_others=False, prune=False, log=print, progress=None,
+           targets=('mixxx',), traktor_platform='mac', traktor_letter='', label=''):
+    """Copies the songs of `playlists` to <drive>/Music once, then writes them for
+    each target: mixxx = Playlists/*.m3u8 (the Pi imports them), traktor = one
+    Traktor/Exporter USB.nml, m3u = M3U/*.m3u for any other player.
+    remove_others: delete .m3u8/.m3u playlist files not in `playlists`.
+    prune: delete songs under Music/ that no playlist left on the drive uses.
+    progress(done, total) is called after each song. Returns a summary string."""
+    targets = [t for t in TARGETS if t in set(targets)] or ['mixxx']
+    need = bytes_to_copy(drive, playlists)
+    free = shutil.disk_usage(drive).free
+    if need > free:
+        raise OSError(f'not enough space on {drive}: needs {need >> 20} MB, {free >> 20} MB free')
+
+    copied = _copy_songs(drive, playlists, log, progress)
+    removed = 0
+    if 'mixxx' in targets:
+        removed += _write_m3u_dir(drive, playlists, PLAYLIST_DIR, '.m3u8', remove_others, log)
+        log(f'Mixxx: {len(playlists)} playlists in {PLAYLIST_DIR}/')
+    if 'm3u' in targets:
+        removed += _write_m3u_dir(drive, playlists, GENERIC_DIR, '.m3u', remove_others, log)
+        log(f'M3U: {len(playlists)} playlists in {GENERIC_DIR}/')
+    if 'traktor' in targets:
+        vol = traktor_volume(traktor_platform, label, traktor_letter)
+        write_traktor_nml(drive, playlists, vol)
+        log(f'Traktor: {TRAKTOR_DIR}/{TRAKTOR_FILE} ({len(playlists)} playlists, drive "{vol}")')
 
     pruned = 0
+    music_root = os.path.join(drive, MUSIC_DIR)
     if prune and os.path.isdir(music_root):
-        used = {os.path.normcase(line_to_file(drive, l))
-                for lines in drive_playlists(drive).values() for l in lines}
+        used = {os.path.normcase(os.path.join(music_root, s.rel)) for pl in playlists for s in pl.songs}
+        for folder in (PLAYLIST_DIR, GENERIC_DIR):
+            for lines in drive_playlists(drive, folder).values():
+                used |= {os.path.normcase(os.path.normpath(os.path.join(drive, folder, l))) for l in lines}
         for dirpath, _, files in os.walk(music_root, topdown=False):
             for f in files:
                 path = os.path.join(dirpath, f)
@@ -318,7 +401,8 @@ def export(drive, playlists, remove_others=False, prune=False, log=print, progre
             if dirpath != music_root and not os.listdir(dirpath):
                 os.rmdir(dirpath)
 
-    summary = f'{len(playlists)} playlists, {copied} songs copied'
+    names = {'mixxx': 'Mixxx', 'traktor': 'Traktor', 'm3u': 'M3U'}
+    summary = f'{len(playlists)} playlists for {" + ".join(names[t] for t in targets)}, {copied} songs copied'
     if remove_others:
         summary += f', {removed} playlists removed'
     if prune:
@@ -335,6 +419,11 @@ def main():
     ap.add_argument('--playlist', action='append', help='export only this playlist (repeatable)')
     ap.add_argument('--list', action='store_true', help='list your playlists and exit')
     ap.add_argument('--prune', action='store_true', help='delete songs under Music/ no playlist uses')
+    ap.add_argument('--for', dest='targets', default='mixxx',
+                    help='comma-separated software to export for: mixxx (default), traktor, m3u')
+    ap.add_argument('--traktor-os', choices=('mac', 'windows'), default='mac',
+                    help='Traktor runs on mac (drive found by name) or windows (by drive letter)')
+    ap.add_argument('--traktor-drive', default='', help='Traktor on Windows: the drive letter, e.g. E')
     args = ap.parse_args()
 
     playlists = load_playlists(args.library, args.source_root)
@@ -357,7 +446,10 @@ def main():
             print('\npass the USB drive root to export, e.g.  python export_playlists.py E:\\')
         return
 
-    print(export(args.drive, playlists, remove_others=not args.playlist, prune=args.prune))
+    label = os.path.basename(os.path.normpath(args.drive)) or ''
+    print(export(args.drive, playlists, remove_others=not args.playlist, prune=args.prune,
+                 targets=[t.strip() for t in args.targets.split(',')], traktor_platform=args.traktor_os,
+                 traktor_letter=args.traktor_drive or args.drive[:1], label=label))
     for p in playlists:
         for m in p.missing:
             print(f'WARNING {p.name}: missing on PC: {m}')

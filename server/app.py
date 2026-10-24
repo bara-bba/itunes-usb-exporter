@@ -111,7 +111,7 @@ VERSION = git_version()
 last_export = None  # {'at': iso time, 'summary': ..., 'ok': bool}
 
 
-def run_export(names, remove_others, prune):
+def run_export(names, remove_others, prune, targets, traktor_platform, traktor_letter):
     def log(msg):
         with job_lock:
             job['log'].append(msg)
@@ -123,7 +123,8 @@ def run_export(names, remove_others, prune):
     try:
         chosen = [p for p in load() if p.name in names]
         summary = ex.export(CFG['USB_ROOT'], chosen, remove_others=remove_others, prune=prune,
-                            log=log, progress=progress)
+                            log=log, progress=progress, targets=targets, traktor_platform=traktor_platform,
+                            traktor_letter=traktor_letter, label=drive_info().get('label', ''))
         getattr(os, "sync", lambda: None)()
         with job_lock:
             job['summary'] = summary
@@ -244,7 +245,9 @@ class Handler(BaseHTTPRequestHandler):
                 job.update(running=True, done=0, total=0, log=[], summary='', error='')
             threading.Thread(target=run_export, daemon=True,
                              args=(set(body.get('names', [])), bool(body.get('remove_others')),
-                                   bool(body.get('prune')))).start()
+                                   bool(body.get('prune')), list(body.get('targets') or ['mixxx']),
+                                   str(body.get('traktor_platform') or 'mac'),
+                                   str(body.get('traktor_letter') or ''))).start()
             return self._send(202, {'started': True})
         if self.path == '/api/eject':
             code, res = eject()

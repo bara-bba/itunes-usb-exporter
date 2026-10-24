@@ -109,6 +109,9 @@
   select, input[type=text] { width: 100%; margin: 4px 0 12px; }
   input[type=checkbox] { accent-color: var(--lime); width: 15px; height: 15px; vertical-align: middle; }
   label.opt { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+  .for { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; width: 100%; }
+  .for select, .for input[type=text] { width: auto; margin: 0; padding: 4px 6px; }
+  .for input[type=text] { width: 54px; text-transform: uppercase; }
   .boxes { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; align-items: start; }
   .box { border: 1px solid var(--hair); padding: 14px; }
   .box .big-line { font: normal 22px var(--display); margin: 8px 0 4px; }
@@ -156,6 +159,18 @@
 const $ = id => document.getElementById(id);
 let data = null, selected = new Set(), preselected = false, wasMounted = false, open = new Set();
 let filter = 'all', search = '', estimate = null, estTimer = null, polling = false;
+// which software to export for: remembered in this browser only
+let exportFor = {targets: ['mixxx'], os: 'mac', letter: 'E'};
+try { exportFor = Object.assign(exportFor, JSON.parse(localStorage.getItem('exportFor') || '{}')); } catch (e) {}
+function saveFor() { try { localStorage.setItem('exportFor', JSON.stringify(exportFor)); } catch (e) {} }
+function showFor() {
+  document.querySelectorAll('.tgt').forEach(c => c.checked = exportFor.targets.includes(c.value));
+  if (!$('trk')) return;
+  $('trk').style.display = exportFor.targets.includes('traktor') ? '' : 'none';
+  $('trkos').value = exportFor.os;
+  $('trkletter').value = exportFor.letter;
+  $('trkletter').style.display = exportFor.os === 'windows' ? '' : 'none';
+}
 
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c])); }
 function gb(n) { return n >= 2 ** 30 ? (n / 2 ** 30).toFixed(1) + ' GB' : Math.round(n / 2 ** 20) + ' MB'; }
@@ -179,7 +194,7 @@ function renderChrome() {
   const d = data.drive, j = data.job;
   $('drivedot').style.background = mounted() ? 'var(--lime)' : d.state === 'ejected' ? 'var(--line)' : 'var(--orange)';
   $('drivedot').title = driveName(d);
-  $('export').disabled = j.running || !mounted() || !selected.size;
+  $('export').disabled = j.running || !mounted() || !selected.size || !exportFor.targets.length;
   $('export').textContent = j.running ? `Exporting ${j.done} / ${j.total}` : 'Export';
   $('bar').style.width = j.running && j.total ? (100 * j.done / j.total) + '%' : '0';
   const jl = $('jobline');
@@ -232,6 +247,13 @@ function viewPlaylists() {
       <tbody>${rows.join('') || `<tr><td colspan="5" class="empty">No playlists ${search || filter !== 'all' ? 'match' : 'found in ' + esc(data.source)}</td></tr>`}</tbody>
     </table></div>
     <div class="pane-foot">
+      <div class="for"><span class="section">Export for</span>
+        <label class="opt"><input type="checkbox" class="tgt" value="mixxx"> Mixxx (Pi)</label>
+        <label class="opt"><input type="checkbox" class="tgt" value="traktor"> Traktor</label>
+        <span id="trk" style="display:none"><select id="trkos"><option value="mac">on Mac</option><option value="windows">on Windows, drive</option></select>
+          <input type="text" id="trkletter" maxlength="1" placeholder="E" style="display:none"></span>
+        <label class="opt"><input type="checkbox" class="tgt" value="m3u"> Other players (.m3u)</label>
+      </div>
       <label class="opt"><input type="checkbox" id="remove"> Remove playlists on the drive that aren't ticked</label>
       <label class="opt"><input type="checkbox" id="prune"> Delete songs no playlist uses</label>
     </div>
@@ -309,6 +331,13 @@ function bind() {
   if ($('search')) $('search').oninput = e => { search = e.target.value; render(); };
   if ($('selall')) $('selall').onclick = () => { data.playlists.forEach(p => selected.add(p.name)); selectionChanged(); render(); };
   if ($('selnone')) $('selnone').onclick = () => { selected.clear(); selectionChanged(); render(); };
+  document.querySelectorAll('.tgt').forEach(c => c.onchange = () => {
+    exportFor.targets = [...document.querySelectorAll('.tgt')].filter(x => x.checked).map(x => x.value);
+    saveFor(); showFor(); renderChrome();
+  });
+  if ($('trkos')) $('trkos').onchange = e => { exportFor.os = e.target.value; saveFor(); showFor(); };
+  if ($('trkletter')) $('trkletter').oninput = e => { exportFor.letter = e.target.value.toUpperCase(); saveFor(); };
+  showFor();
   if ($('eject')) $('eject').onclick = eject;
   if ($('format')) $('format').onclick = format;
 }
@@ -329,7 +358,11 @@ $('export').onclick = async () => {
   const remove = $('remove') && $('remove').checked, prune = $('prune') && $('prune').checked;
   const del = [remove && 'playlists that are not ticked', prune && 'songs no playlist uses'].filter(Boolean);
   if (del.length && !confirm('This will delete ' + del.join(' and ') + ' on the USB drive. Continue?')) return;
-  try { await api('/api/export', {names: [...selected], remove_others: remove, prune}); watchJob(); }
+  try {
+    await api('/api/export', {names: [...selected], remove_others: remove, prune, targets: exportFor.targets,
+                              traktor_platform: exportFor.os, traktor_letter: exportFor.letter});
+    watchJob();
+  }
   catch (e) { alert(e.message); }
 };
 
@@ -373,7 +406,7 @@ async function watchJob() {
 window.addEventListener('hashchange', render);
 refresh().then(() => { if (data && data.job.running) watchJob(); selectionChanged(); });
 setInterval(() => {
-  const typing = document.activeElement && ['search', 'newlabel'].includes(document.activeElement.id);
+  const typing = document.activeElement && ['search', 'newlabel', 'trkletter'].includes(document.activeElement.id);
   if (!polling && !typing && !(data && data.job.running)) refresh();
 }, 4000);
 </script>
