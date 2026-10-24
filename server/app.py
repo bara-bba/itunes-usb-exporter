@@ -10,7 +10,7 @@ standard library only. Configured by environment variables
   SOURCE_ROOT   folder whose Artist/Album layout is kept   (/mnt/music/data)
   PLAYLIST_DIR  folder with the .m3u/.m3u8 playlists       (/mnt/music/playlists)
   PATH_MAP      how Windows paths in the playlists map     (Z:\\=/mnt/music)
-  USB_ROOT      where the host mounts the USB drive        (/mnt/usb)
+  USB_ROOT      where the host mounts the USB drive        (/mnt/usb/drive)
   CTL_DIR       status/eject files shared with the host    (/mnt/usb-ctl)
   PORT          HTTP port                                  (8080)
 """
@@ -30,7 +30,7 @@ CFG = {
     'SOURCE_ROOT': '/mnt/music/data',
     'PLAYLIST_DIR': '/mnt/music/playlists',
     'PATH_MAP': 'Z:\\=/mnt/music',
-    'USB_ROOT': '/mnt/usb',
+    'USB_ROOT': '/mnt/usb/drive',
     'CTL_DIR': '/mnt/usb-ctl',
     'PORT': '8080',
     'FONT_DIR': '/etc/usb-exporter/fonts',  # optional TAN-SPRING.otf (not shipped: commercial font)
@@ -53,7 +53,9 @@ def drive_info():
                 info[k.strip()] = v.strip()
     except OSError:
         pass
-    if info['state'] == 'mounted' and os.path.isdir(CFG['USB_ROOT']):
+    # Trust the host's status only if the drive really is mounted here; otherwise
+    # USB_ROOT is the empty folder under it and an export would fill the container.
+    if info['state'] == 'mounted' and os.path.ismount(CFG['USB_ROOT']):
         try:
             du = shutil.disk_usage(CFG['USB_ROOT'])
             info.update(free=du.free, total=du.total)

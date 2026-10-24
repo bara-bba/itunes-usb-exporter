@@ -32,7 +32,7 @@ command -v pct >/dev/null || die "pct not found - run this on a Proxmox VE host"
 # ----------------------------------------------------------- host side ----
 write_host_files() {
     local port_match="$1"
-    mkdir -p "$BASE/music" "$BASE/usb" "$CTL" /usr/local/sbin
+    mkdir -p "$BASE/music" "$BASE/usb/drive" "$CTL" /usr/local/sbin
     chown "$CT_ROOT_UID:$CT_ROOT_UID" "$CTL"
     chmod 775 "$CTL"
 
@@ -48,7 +48,7 @@ EOF
 #!/bin/sh
 # udev -> usb-exporter-mount@<dev>.service: mount the drive for the container.
 DEV=/dev/\$1
-MP=$BASE/usb
+MP=$BASE/usb/drive
 findmnt -rn -M "\$MP" -o SOURCE | grep -q '^/dev/sd' && exit 0   # one drive at a time
 FSTYPE=\$(blkid -o value -s TYPE "\$DEV") || exit 0
 LABEL=\$(blkid -o value -s LABEL "\$DEV" || true)
@@ -70,7 +70,7 @@ EOF
     cat > /usr/local/sbin/usb-exporter-eject <<EOF
 #!/bin/sh
 # usb-exporter-eject.path -> asked by the container (Eject button).
-MP=$BASE/usb
+MP=$BASE/usb/drive
 rm -f $CTL/eject
 sync
 if findmnt -rn -M "\$MP" -o SOURCE | grep -q '^/dev/sd'; then
@@ -85,7 +85,7 @@ EOF
 # usb-exporter-format.path -> asked by the container (Format button).
 # Request file: fstype=vfat|exfat, label=NAME. Only ever touches the disk of
 # the drive currently mounted from the chosen USB port.
-MP=$BASE/usb
+MP=$BASE/usb/drive
 REQ=$CTL/format
 PORT_MATCH='$port_match'
 FS=\$(sed -n 's/^fstype=//p' "\$REQ"); LABEL=\$(sed -n 's/^label=//p' "\$REQ")
@@ -97,7 +97,10 @@ DISK=/dev/\$(lsblk -no PKNAME "\$PART" | head -1)
 [ "\$DISK" != /dev/ ] || DISK=\$PART                          # partitionless drive
 [ "\$(lsblk -dno TRAN "\$DISK")" = usb ] || fail "\$DISK is not a USB disk"
 if [ -n "\$PORT_MATCH" ]; then
-    udevadm info -q property -n "\$DISK" | grep -q "^ID_PATH=\$PORT_MATCH" || fail "\$DISK is not on the chosen USB port"
+    DPATH=\$(udevadm info -q property -n "\$DISK" | sed -n 's/^ID_PATH=//p')
+    ok=
+    for p in \$PORT_MATCH; do case "\$DPATH" in "\$p"*) ok=1 ;; esac; done
+    [ -n "\$ok" ] || fail "\$DISK is not on the chosen USB port(s)"
 fi
 case "\$FS" in
     vfat)  TYPE=c; LABEL=\$(printf '%s' "\$LABEL" | tr -cd 'A-Za-z0-9_-' | cut -c1-11 | tr a-z A-Z) ;;
@@ -122,7 +125,7 @@ EOF
     cat > /usr/local/sbin/usb-exporter-unplugged <<EOF
 #!/bin/sh
 # Drive pulled without ejecting: drop the stale mount.
-MP=$BASE/usb
+MP=$BASE/usb/drive
 [ "\$(findmnt -rn -M "\$MP" -o SOURCE | grep '^/dev/sd')" = "/dev/\$1" ] || exit 0
 umount -l "\$MP"
 /usr/local/sbin/usb-exporter-status none
@@ -189,13 +192,18 @@ ExecStart=/bin/sh -c 'mkdir -p $BASE/usb; findmnt -rn -M $BASE/usb >/dev/null ||
 WantedBy=multi-user.target
 EOF
 
-    local port_cond=''
-    [ -n "$port_match" ] && port_cond=", ENV{ID_PATH}==\"$port_match*\""
-    cat > /etc/udev/rules.d/90-usb-exporter.rules <<EOF
-# usb-exporter: mount USB drives plugged into the chosen port for the container
-ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem"$port_cond, TAG+="systemd", ENV{SYSTEMD_WANTS}+="usb-exporter-mount@%k.service"
-ACTION=="remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", RUN+="/bin/systemctl --no-block start usb-exporter-unplugged@%k.service"
-EOF
+    # port_match: space-separated ID_PATH prefixes (one per allowed USB port); empty = any port
+    local add='ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem"'
+    local mount='TAG+="systemd", ENV{SYSTEMD_WANTS}+="usb-exporter-mount@%k.service"' p
+    {
+        echo "# usb-exporter: mount USB drives plugged into the chosen port(s) for the container"
+        if [ -n "$port_match" ]; then
+            for p in $port_match; do echo "$add, ENV{ID_PATH}==\"$p*\", $mount"; done
+        else
+            echo "$add, $mount"
+        fi
+        echo 'ACTION=="remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", RUN+="/bin/systemctl --no-block start usb-exporter-unplugged@%k.service"'
+    } > /etc/udev/rules.d/90-usb-exporter.rules
 
     systemctl daemon-reload
     command -v mkfs.vfat >/dev/null && command -v mkfs.exfat >/dev/null \
@@ -252,7 +260,7 @@ MUSIC_ROOT=/mnt/music
 SOURCE_ROOT=/mnt/music/$data_dir
 PLAYLIST_DIR=/mnt/music/$playlist_dir
 PATH_MAP=$prefix=/mnt/music
-USB_ROOT=/mnt/usb
+USB_ROOT=/mnt/usb/drive
 CTL_DIR=/mnt/usb-ctl
 PORT=8080
 EOF

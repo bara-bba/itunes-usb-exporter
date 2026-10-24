@@ -50,6 +50,8 @@ EOF
 chmod 755 /usr/local/bin/update
 
 mkdir -p /mnt/music /mnt/usb /mnt/usb-ctl /etc/usb-exporter/fonts
+# older installs mounted the drive at /mnt/usb itself; it now lives one level down
+sed -i "s|^USB_ROOT=/mnt/usb$|USB_ROOT=/mnt/usb/drive|" /etc/usb-exporter.env 2>/dev/null || true
 systemctl daemon-reload
 systemctl enable -q usb-exporter
 systemctl restart usb-exporter
