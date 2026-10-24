@@ -49,6 +49,7 @@ EOF
 # udev -> usb-exporter-mount@<dev>.service: mount the drive for the container.
 DEV=/dev/\$1
 MP=$BASE/usb/drive
+[ -e /run/usb-exporter-formatting ] && exit 0                      # the format script mounts it itself
 findmnt -rn -M "\$MP" -o SOURCE | grep -q '^/dev/sd' && exit 0   # one drive at a time
 FSTYPE=\$(blkid -o value -s TYPE "\$DEV") || exit 0
 LABEL=\$(blkid -o value -s LABEL "\$DEV" || true)
@@ -109,16 +110,26 @@ case "\$FS" in
 esac
 [ -n "\$LABEL" ] || LABEL=MUSIC
 /usr/local/sbin/usb-exporter-status formatting "\$LABEL" "\$FS" "\$PART"
+touch /run/usb-exporter-formatting                    # keeps usb-exporter-mount away meanwhile
+trap 'rm -f /run/usb-exporter-formatting' EXIT
 sync
-findmnt -rn -M "\$MP" -o SOURCE | grep -q '^/dev/sd' && { umount "\$MP" || fail "drive is busy"; }
+unmount_all() {  # every mount of this disk, also stacked ones
+    for dev in \$(lsblk -lnpo NAME "\$DISK"); do
+        while findmnt -rn -S "\$dev" >/dev/null; do umount "\$dev" 2>/dev/null || umount -l "\$dev"; done
+    done
+}
+unmount_all
+for dev in \$(lsblk -lnpo NAME,TYPE "\$DISK" | awk '\$2=="part"{print \$1}'); do wipefs -aq "\$dev"; done
 wipefs -aq "\$DISK" || fail "wipefs failed"
-printf 'label: dos\n,,%s\n' "\$TYPE" | sfdisk -q "\$DISK" || fail "partitioning failed"
+printf 'label: dos\n,,%s\n' "\$TYPE" | sfdisk -q --wipe always --wipe-partitions always "\$DISK" || fail "partitioning failed"
 udevadm settle; partprobe "\$DISK" 2>/dev/null || true; udevadm settle
 NEW=\$(lsblk -lnpo NAME,TYPE "\$DISK" | awk '\$2=="part"{print \$1; exit}')
 [ -b "\$NEW" ] || fail "new partition not found"
+unmount_all
 if [ "\$FS" = vfat ]; then mkfs.vfat -F 32 -n "\$LABEL" "\$NEW" >/dev/null || fail "mkfs.vfat failed"
 else mkfs.exfat -L "\$LABEL" "\$NEW" >/dev/null || fail "mkfs.exfat failed"; fi
 udevadm settle
+rm -f /run/usb-exporter-formatting
 /usr/local/sbin/usb-exporter-mount "\$(basename "\$NEW")"
 EOF
 
@@ -126,8 +137,8 @@ EOF
 #!/bin/sh
 # Drive pulled without ejecting: drop the stale mount.
 MP=$BASE/usb/drive
-[ "\$(findmnt -rn -M "\$MP" -o SOURCE | grep '^/dev/sd')" = "/dev/\$1" ] || exit 0
-umount -l "\$MP"
+[ "\$(findmnt -rn -M "\$MP" -o SOURCE | grep '^/dev/sd' | head -1)" = "/dev/\$1" ] || exit 0
+while findmnt -rn -M "\$MP" -o SOURCE | grep -q '^/dev/sd'; do umount -l "\$MP"; done
 /usr/local/sbin/usb-exporter-status none
 EOF
     chmod 755 /usr/local/sbin/usb-exporter-*
