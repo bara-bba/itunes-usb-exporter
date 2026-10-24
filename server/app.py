@@ -33,6 +33,7 @@ CFG = {
     'USB_ROOT': '/mnt/usb',
     'CTL_DIR': '/mnt/usb-ctl',
     'PORT': '8080',
+    'FONT_DIR': '/etc/usb-exporter/fonts',  # optional TAN-SPRING.otf (not shipped: commercial font)
 }
 CFG.update({k: os.environ[k] for k in CFG if os.environ.get(k)})
 PATH_MAP = ex.parse_path_map(CFG['PATH_MAP'])
@@ -76,7 +77,14 @@ def state():
     for p in load():
         names.add(p.name)
         st, detail = ex.compare(p, on_drive.get(p.name), usb) if mounted else ('', '')
-        rows.append({'name': p.name, 'songs': len(p.songs), 'missing': p.missing[:20],
+        want = [s.line for s in p.songs]
+        have = on_drive.get(p.name) or []
+        key = os.path.normcase
+        have_k, want_k = {key(x) for x in have}, {key(x) for x in want}
+        song_name = lambda line: os.path.splitext(line.rsplit('/', 1)[-1])[0]
+        rows.append({'name': p.name, 'songs': len(p.songs), 'missing': p.missing[:50],
+                     'to_add': [song_name(x) for x in want if key(x) not in have_k][:50],
+                     'only_drive': [song_name(x) for x in have if key(x) not in want_k][:50],
                      'missing_count': len(p.missing), 'state': st, 'detail': detail})
     extra = [{'name': n, 'songs': len(lines)} for n, lines in on_drive.items() if n not in names]
     with job_lock:
@@ -127,6 +135,41 @@ def eject():
     return 504, {'error': 'the host did not unmount the drive - is usb-exporter-eject.path running on Proxmox?'}
 
 
+def format_drive(fstype, label, confirm):
+    """Asks the host to wipe and reformat the USB drive (usb-exporter-format.path)."""
+    with job_lock:
+        if job['running']:
+            return 409, {'error': 'an export is running'}
+    info = drive_info()
+    if info['state'] not in ('mounted', 'ejected', 'error') or not info.get('device'):
+        return 409, {'error': 'no USB drive to format'}
+    if fstype not in ('vfat', 'exfat'):
+        return 400, {'error': 'filesystem must be vfat (FAT32) or exfat'}
+    if confirm != (info.get('label') or 'FORMAT'):
+        return 400, {'error': 'confirmation does not match the drive label'}
+    getattr(os, 'sync', lambda: None)()
+    req = os.path.join(CFG['CTL_DIR'], 'format')
+    with open(req + '.tmp', 'w') as f:
+        f.write(f'fstype={fstype}\nlabel={label}\n')
+    os.replace(req + '.tmp', req)  # the host watches for the final name only
+    for _ in range(240):  # partitioning + mkfs of a big drive takes a while
+        time.sleep(0.5)
+        st = drive_info()
+        if st['state'] == 'mounted' and not os.path.exists(req):
+            return 200, {'state': 'mounted', 'label': st['label'], 'fstype': st['fstype']}
+        if st['state'] == 'error' and not os.path.exists(req):
+            return 500, {'error': 'format failed: ' + st.get('device', '')}
+    return 504, {'error': 'the host did not finish formatting - is usb-exporter-format.path running on Proxmox?'}
+
+
+def estimate(names):
+    usb = CFG['USB_ROOT']
+    if drive_info()['state'] != 'mounted':
+        return {'bytes': 0}
+    chosen = [p for p in load() if p.name in names]
+    return {'bytes': ex.bytes_to_copy(usb, chosen)}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -149,6 +192,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == '/api/job':
             with job_lock:
                 return self._send(200, dict(job, log=job['log'][-200:]))
+        if self.path.startswith('/fonts/'):
+            path = os.path.join(CFG['FONT_DIR'], os.path.basename(self.path))
+            if os.path.isfile(path):
+                with open(path, 'rb') as f:
+                    return self._send(200, f.read(), 'font/otf')
         self._send(404, {'error': 'not found'})
 
     def do_POST(self):
@@ -171,6 +219,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == '/api/eject':
             code, res = eject()
             return self._send(code, res)
+        if self.path == '/api/format':
+            code, res = format_drive(body.get('fstype'), str(body.get('label') or ''), body.get('confirm'))
+            return self._send(code, res)
+        if self.path == '/api/estimate':
+            return self._send(200, estimate(set(body.get('names', []))))
         self._send(404, {'error': 'not found'})
 
 

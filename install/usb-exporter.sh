@@ -80,6 +80,45 @@ else
 fi
 EOF
 
+    cat > /usr/local/sbin/usb-exporter-format <<EOF
+#!/bin/sh
+# usb-exporter-format.path -> asked by the container (Format button).
+# Request file: fstype=vfat|exfat, label=NAME. Only ever touches the disk of
+# the drive currently mounted from the chosen USB port.
+MP=$BASE/usb
+REQ=$CTL/format
+PORT_MATCH='$port_match'
+FS=\$(sed -n 's/^fstype=//p' "\$REQ"); LABEL=\$(sed -n 's/^label=//p' "\$REQ")
+rm -f "\$REQ"
+fail() { echo "format: \$*" >&2; /usr/local/sbin/usb-exporter-status error "\$LABEL" "\$FS" "\$*"; exit 1; }
+PART=\$(sed -n 's/^device=//p' $CTL/status)
+[ -b "\$PART" ] || fail "no USB drive to format"
+DISK=/dev/\$(lsblk -no PKNAME "\$PART" | head -1)
+[ "\$DISK" != /dev/ ] || DISK=\$PART                          # partitionless drive
+[ "\$(lsblk -dno TRAN "\$DISK")" = usb ] || fail "\$DISK is not a USB disk"
+if [ -n "\$PORT_MATCH" ]; then
+    udevadm info -q property -n "\$DISK" | grep -q "^ID_PATH=\$PORT_MATCH" || fail "\$DISK is not on the chosen USB port"
+fi
+case "\$FS" in
+    vfat)  TYPE=c; LABEL=\$(printf '%s' "\$LABEL" | tr -cd 'A-Za-z0-9_-' | cut -c1-11 | tr a-z A-Z) ;;
+    exfat) TYPE=7; LABEL=\$(printf '%s' "\$LABEL" | cut -c1-15) ;;
+    *)     fail "unsupported filesystem '\$FS'" ;;
+esac
+[ -n "\$LABEL" ] || LABEL=MUSIC
+/usr/local/sbin/usb-exporter-status formatting "\$LABEL" "\$FS" "\$PART"
+sync
+findmnt -rn -M "\$MP" -o SOURCE | grep -q '^/dev/sd' && { umount "\$MP" || fail "drive is busy"; }
+wipefs -aq "\$DISK" || fail "wipefs failed"
+printf 'label: dos\n,,%s\n' "\$TYPE" | sfdisk -q "\$DISK" || fail "partitioning failed"
+udevadm settle; partprobe "\$DISK" 2>/dev/null || true; udevadm settle
+NEW=\$(lsblk -lnpo NAME,TYPE "\$DISK" | awk '\$2=="part"{print \$1; exit}')
+[ -b "\$NEW" ] || fail "new partition not found"
+if [ "\$FS" = vfat ]; then mkfs.vfat -F 32 -n "\$LABEL" "\$NEW" >/dev/null || fail "mkfs.vfat failed"
+else mkfs.exfat -L "\$LABEL" "\$NEW" >/dev/null || fail "mkfs.exfat failed"; fi
+udevadm settle
+/usr/local/sbin/usb-exporter-mount "\$(basename "\$NEW")"
+EOF
+
     cat > /usr/local/sbin/usb-exporter-unplugged <<EOF
 #!/bin/sh
 # Drive pulled without ejecting: drop the stale mount.
@@ -120,6 +159,22 @@ Unit=usb-exporter-eject.service
 [Install]
 WantedBy=multi-user.target
 EOF
+    cat > /etc/systemd/system/usb-exporter-format.service <<'EOF'
+[Unit]
+Description=Format the usb-exporter USB drive
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/usb-exporter-format
+EOF
+    cat > /etc/systemd/system/usb-exporter-format.path <<EOF
+[Unit]
+Description=Watch for format requests from the usb-exporter container
+[Path]
+PathExists=$CTL/format
+Unit=usb-exporter-format.service
+[Install]
+WantedBy=multi-user.target
+EOF
     # The drive is mounted ON this bind mount; "shared" makes that mount
     # propagate into the container (its lxc.mount.entry is rslave).
     cat > /etc/systemd/system/usb-exporter-propagation.service <<EOF
@@ -143,7 +198,9 @@ ACTION=="remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", RUN+="/bin/systemctl -
 EOF
 
     systemctl daemon-reload
-    systemctl enable -q --now usb-exporter-propagation.service usb-exporter-eject.path
+    command -v mkfs.vfat >/dev/null && command -v mkfs.exfat >/dev/null \
+        || apt-get install -y -qq dosfstools exfatprogs >/dev/null
+    systemctl enable -q --now usb-exporter-propagation.service usb-exporter-eject.path usb-exporter-format.path
     udevadm control --reload-rules
     [ -f "$CTL/status" ] || /usr/local/sbin/usb-exporter-status none
 }
@@ -202,10 +259,12 @@ EOF
 }
 
 run_in_ct() {
-    local ctid="$1"
+    # Keeps the container's own git source (e.g. a Gitea remote set for auto-deploy).
+    local ctid="$1" src
+    src=$(pct exec "$ctid" -- git -C /opt/usb-exporter remote get-url origin 2>/dev/null) || src="${GIT_URL:-$REPO}"
     curl -fsSL "$RAW/install/lxc-install.sh" -o /tmp/usb-exporter-lxc-install.sh
     pct push "$ctid" /tmp/usb-exporter-lxc-install.sh /root/lxc-install.sh
-    pct exec "$ctid" -- bash /root/lxc-install.sh "$REPO" "$BRANCH"
+    pct exec "$ctid" -- bash /root/lxc-install.sh "$src" "$BRANCH"
 }
 
 ct_ip() {
@@ -303,7 +362,8 @@ do_install() {
     echo "  Update later: run this script again (or 'update' inside the container)."
 }
 
-existing=$(grep -l "^tags:.*\b$TAG\b" /etc/pve/lxc/*.conf 2>/dev/null | head -1 | xargs -r basename | sed 's/\.conf$//')
+# no match = grep exits 1, which pipefail would turn into a silent exit on a first install
+existing=$(grep -l "^tags:.*\b$TAG\b" /etc/pve/lxc/*.conf 2>/dev/null | head -1 | xargs -r basename | sed 's/\.conf$//') || true
 if [ -n "$existing" ] && [ "${1:-}" != "install" ]; then
     echo "Found the usb-exporter container: $existing"
     if yes_no "Update it?"; then do_update "$existing"; exit 0; fi

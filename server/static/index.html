@@ -9,6 +9,9 @@
     --ink: #0B0B0B; --panel: #121211; --line: #E8E8E2; --dim: #8C8C86; --faint: #5A5A55;
     --edge: #3A3A36; --hair: #2A2A28; --lime: #C8F53C; --orange: #E8A33A; --red: #FF2B1C;
   }
+  /* optional, served from FONT_DIR on the server (not in the repo: commercial font) */
+  @font-face { font-family: "TAN Spring"; src: url(/fonts/TAN-SPRING.otf) format("opentype"); }
+  .display { font-family: "TAN Spring", Arial, sans-serif; }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--ink); color: var(--line); font: 14px/1.4 Arial, "Liberation Sans", sans-serif; }
   header { display: flex; align-items: baseline; gap: 14px; padding: 16px 20px 10px; border-bottom: 1px solid var(--hair); }
@@ -41,11 +44,22 @@
   pre { background: var(--panel); color: var(--dim); border: 1px solid var(--hair); padding: 8px 10px;
         height: 170px; overflow: auto; margin: 0; font: 12px Consolas, "DejaVu Sans Mono", monospace; white-space: pre-wrap; }
   .toolbar { display: flex; gap: 8px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+  h1, .drive-name, button.accent { font-family: "TAN Spring", Arial, sans-serif; }
+  h1 { font-size: 34px; }
+  button.accent { text-transform: none; letter-spacing: 0; font-weight: normal; font-size: 20px; }
+  button.danger { color: var(--red); border-color: #5a1f1a; }
+  button.danger:hover:not(:disabled) { color: var(--ink); background: var(--red); border-color: var(--red); }
+  .more { color: var(--faint); cursor: pointer; font-size: 12px; margin-left: 6px; }
+  .more:hover { color: var(--line); }
+  tr.details td { background: var(--panel); font-size: 12px; color: var(--dim); padding: 6px 8px 10px 48px; }
+  tr.details b { color: var(--line); font-weight: normal; display: block; margin-top: 4px; }
+  select, input[type=text] { background: var(--ink); color: var(--line); border: 1px solid var(--edge); padding: 6px; font: 13px Arial, sans-serif; width: 100%; margin: 4px 0 8px; }
+  #need.over { color: var(--red); }
 </style>
 </head>
 <body>
 <header>
-  <h1>NAS &rarr; USB</h1>
+  <h1 class="display">NAS &rarr; USB</h1>
   <span class="section">Playlist exporter</span>
 </header>
 <main>
@@ -58,6 +72,7 @@
       <button id="all">Select all</button>
       <button id="none">Select none</button>
       <span id="count" class="muted"></span>
+      <span id="need" class="muted"></span>
     </div>
     <div class="bar"><div id="bar"></div></div>
     <pre id="log"></pre>
@@ -75,12 +90,20 @@
       <label class="opt"><input type="checkbox" id="prune"> Delete songs no playlist on the drive uses any more</label>
     </div>
     <button id="export" class="accent">Export</button>
+    <div class="box" style="margin-top:16px">
+      <div class="section">Format drive</div>
+      <p class="muted">Erases everything on the USB drive.</p>
+      <select id="fstype"><option value="vfat">FAT32 (works everywhere, files up to 4 GB)</option>
+        <option value="exfat">exFAT (big files, newer players)</option></select>
+      <input type="text" id="newlabel" placeholder="New name (e.g. MUSIC)" maxlength="15">
+      <button id="format" class="danger">Format&hellip;</button>
+    </div>
     <p class="muted" id="source"></p>
   </aside>
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let data = null, selected = new Set(), preselected = false, wasMounted = false, polling = null;
+let data = null, selected = new Set(), preselected = false, wasMounted = false, open = new Set(), estTimer = null;
 
 function gb(n) { return n >= 2 ** 30 ? (n / 2 ** 30).toFixed(1) + ' GB' : Math.round(n / 2 ** 20) + ' MB'; }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c])); }
@@ -109,13 +132,28 @@ function render() {
 
   const rows = data.playlists.map(p => {
     const cls = p.state === 'in sync' ? 'in-sync' : p.state === 'differs' ? 'differs' : '';
-    const warn = p.missing_count ? `<div class="warn" title="${esc(p.missing.join('\n'))}">${p.missing_count} not found on the NAS</div>` : '';
-    return `<tr class="row ${cls}" data-name="${esc(p.name)}"><td><input type="checkbox" ${selected.has(p.name) ? 'checked' : ''}></td>` +
-           `<td>${esc(p.name)}</td><td class="num">${p.songs}</td><td>${esc(p.state || '–')}</td><td>${esc(p.detail)}${warn}</td></tr>`;
+    const warn = p.missing_count ? `<div class="warn">${p.missing_count} not found on the NAS</div>` : '';
+    const hasMore = p.missing_count || (p.state === 'differs' && (p.to_add.length || p.only_drive.length));
+    const more = hasMore ? `<span class="more" data-more="${esc(p.name)}">${open.has(p.name) ? 'hide' : 'songs'}</span>` : '';
+    let html = `<tr class="row ${cls}" data-name="${esc(p.name)}"><td><input type="checkbox" ${selected.has(p.name) ? 'checked' : ''}></td>` +
+           `<td>${esc(p.name)}</td><td class="num">${p.songs}</td><td>${esc(p.state || '–')}</td><td>${esc(p.detail)}${more}${warn}</td></tr>`;
+    if (hasMore && open.has(p.name)) {
+      const list = (title, items) => items.length ? `<b>${title}</b>${items.map(esc).join('<br>')}` : '';
+      html += `<tr class="details"><td colspan="5">` +
+        (p.state === 'differs' ? list('Will be added to the drive', p.to_add) + list('Only on the drive (removed from the playlist)', p.only_drive) : '') +
+        list('Not found on the NAS', p.missing) + `</td></tr>`;
+    }
+    return html;
   });
   rows.push(...data.only_on_drive.map(p =>
     `<tr class="only"><td></td><td>${esc(p.name)}</td><td class="num">${p.songs}</td><td>only on drive</td><td>not on the NAS</td></tr>`));
   $('rows').innerHTML = rows.join('') || '<tr><td colspan="5" class="muted">No playlists found in ' + esc(data.source) + '</td></tr>';
+  document.querySelectorAll('[data-more]').forEach(el => el.onclick = e => {
+    e.stopPropagation();
+    const n = el.dataset.more;
+    open.has(n) ? open.delete(n) : open.add(n);
+    render();
+  });
   document.querySelectorAll('tr.row').forEach(tr => tr.onclick = e => {
     const n = tr.dataset.name;
     selected.has(n) ? selected.delete(n) : selected.add(n);
@@ -130,12 +168,26 @@ function render() {
 function count() {
   const songs = data.playlists.filter(p => selected.has(p.name)).reduce((a, p) => a + p.songs, 0);
   $('count').textContent = `${selected.size} of ${data.playlists.length} playlists ticked, ${songs} songs`;
+  clearTimeout(estTimer);
+  estTimer = setTimeout(estimate, 300);
+}
+
+async function estimate() {
+  const d = data && data.drive;
+  if (!d || d.state !== 'mounted' || !selected.size) { $('need').textContent = ''; return; }
+  try {
+    const r = await api('/api/estimate', {names: [...selected]});
+    $('need').textContent = r.bytes ? `· ${gb(r.bytes)} to copy, ${gb(d.free)} free` : '· nothing new to copy';
+    $('need').className = r.bytes > d.free ? 'over' : 'muted';
+  } catch (e) { $('need').textContent = ''; }
 }
 
 function renderJob(j) {
   const mounted = data && data.drive.state === 'mounted';
+  const formattable = data && ['mounted', 'ejected', 'error'].includes(data.drive.state) && data.drive.device;
   $('export').disabled = j.running || !mounted;
   $('eject').disabled = j.running || !mounted;
+  $('format').disabled = j.running || !formattable;
   $('export').textContent = j.running ? `Exporting ${j.done} / ${j.total}` : 'Export';
   $('bar').style.width = j.total ? (100 * j.done / j.total) + '%' : (j.summary ? '100%' : '0');
   const log = $('log'), atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
@@ -170,6 +222,21 @@ $('eject').onclick = async () => {
   $('eject').disabled = true; $('eject').textContent = 'Ejecting…';
   try { await api('/api/eject', {}); } catch (e) { alert(e.message); }
   $('eject').textContent = 'Eject';
+  refresh();
+};
+
+$('format').onclick = async () => {
+  const d = data.drive, label = d.label || 'FORMAT';
+  const fs = $('fstype').value, name = $('newlabel').value.trim() || 'MUSIC';
+  const typed = prompt(`This ERASES everything on "${label}" and formats it as ${fs === 'vfat' ? 'FAT32' : 'exFAT'} named "${name}".\n\nType the drive's current name to confirm: ${label}`);
+  if (typed === null) return;
+  $('format').disabled = true; $('format').textContent = 'Formatting…';
+  try {
+    const r = await api('/api/format', {fstype: fs, label: name, confirm: typed.trim()});
+    alert(`Formatted: "${r.label}" (${r.fstype}).`);
+    preselected = false;
+  } catch (e) { alert(e.message); }
+  $('format').textContent = 'Format…';
   refresh();
 };
 

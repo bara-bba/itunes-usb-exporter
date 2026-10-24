@@ -1,0 +1,30 @@
+# Every push to Gitea -> mirror all branches and tags to GitHub.
+# Gitea's own push mirror refuses SSH to GitHub here, so this uses a deploy key
+# that can only write to bara-bba/itunes-usb-exporter: private half in the repo
+# secret MIRROR_SSH_KEY, public half as a write deploy key on GitHub.
+name: Mirror to GitHub
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["**"]
+
+jobs:
+  mirror:
+    runs-on: usb-exporter
+    steps:
+      - name: Push to GitHub
+        env:
+          KEY: ${{ secrets.MIRROR_SSH_KEY }}
+        run: |
+          set -eu
+          umask 077
+          printf '%s\n' "$KEY" > mirror_key
+          rm -rf repo.git
+          git clone -q --mirror "${{ github.server_url }}/${{ github.repository }}.git" repo.git
+          cd repo.git
+          GIT_SSH_COMMAND="ssh -i ../mirror_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+            git push -q --force --prune git@github.com:bara-bba/itunes-usb-exporter.git \
+              'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
+          cd ..
+          rm -rf repo.git mirror_key

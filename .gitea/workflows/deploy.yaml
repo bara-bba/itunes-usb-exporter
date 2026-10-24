@@ -1,0 +1,33 @@
+# Push a tag like v0.3.0 -> check the code -> deploy that tag to the usb-exporter
+# container. Runs on the act_runner inside that container (label "usb-exporter",
+# host mode), so deploying is just its own `update <tag>`. See install/setup-runner.sh.
+name: Check and deploy
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  check-and-deploy:
+    runs-on: usb-exporter
+    steps:
+      - name: Check out the tag
+        run: |
+          rm -rf src
+          git clone -q --depth 1 --branch "${{ github.ref_name }}" "${{ github.server_url }}/${{ github.repository }}.git" src
+
+      - name: Check
+        run: |
+          cd src
+          python3 -m py_compile export_playlists.py server/app.py
+          for f in install/*.sh; do bash -n "$f"; done
+          python3 - <<'EOF'
+          import export_playlists as ex
+          pm = ex.parse_path_map('Z:\\=/mnt/music')
+          assert ex.map_playlist_line('Z:\\data\\A\\b.m4a', '/x', pm) == '/mnt/music/data/A/b.m4a'
+          assert ex.map_playlist_line('C:\\other\\b.m4a', '/x', pm) is None
+          print('path mapping ok')
+          EOF
+
+      - name: Deploy
+        run: /usr/local/bin/update "${{ github.ref_name }}"

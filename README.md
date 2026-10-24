@@ -38,11 +38,31 @@ port) when asked and that physical port is remembered. It then:
 - installs a udev rule + services on the host that mount any drive plugged into
   that port at `/mnt/usb-exporter/usb` (vfat/exFAT/NTFS, owned by the container's
   root) and propagate it into the container as `/mnt/usb`;
-- wires the page's **Eject** button to the host (the container writes a request
-  file, `usb-exporter-eject.path` unmounts the drive).
+- wires the page's **Eject** and **Format** buttons to the host (the container
+  writes a request file, `usb-exporter-eject.path` / `usb-exporter-format.path`
+  run the action). Format only ever touches the disk mounted from the chosen
+  port: it wipes it, makes one partition and formats it FAT32 or exFAT with the
+  name you give, then mounts it again. You confirm by typing the drive's current name.
 
 Run the same command again to **update** (it finds the container by its tag);
-inside the container, `update` does the app part only.
+inside the container, `update [branch|tag]` does the app part only.
+
+The page's titles use the TAN Spring font if `/etc/usb-exporter/fonts/TAN-SPRING.otf`
+exists in the container (Arial otherwise). The font is commercial, so it's not in
+this repo: copy your own licensed file there.
+
+## Repos, releases and auto-deploy
+
+Developed on Gitea (`http://192.168.42.73:3000/bara-bba/itunes-usb-exporter`);
+every push is mirrored to GitHub (`bara-bba/itunes-usb-exporter`) by
+`.gitea/workflows/mirror.yaml`, using a write deploy key for this repo only
+(private half in the Gitea Actions secret `MIRROR_SSH_KEY`).
+
+Push a tag like `v0.3.0` to Gitea: `.gitea/workflows/deploy.yaml` runs the checks
+on the act_runner inside the container (label `usb-exporter`, host mode, see
+`install/setup-runner.sh`) and, if they pass, deploys that tag there (`update v0.3.0`).
+
+    git tag -a v0.3.0 -m "..." && git push origin v0.3.0
 
 Why the host mounts the drive: an unprivileged container may use a block device
 but the kernel won't let it mount one. Passing the device in and mounting it with
@@ -50,8 +70,9 @@ FUSE works for exFAT/NTFS but not reliably for FAT32, the usual format.
 
 The page (open `http://<container-ip>:8080`, also from a phone) shows each NAS
 playlist with its state on the plugged-in drive (in sync / differs / not on
-drive / only on drive), songs the NAS doesn't have, Export with progress, and
-Eject. Playlist paths like `Z:\data\Artist\Album\song.m4a` are mapped with
+drive / only on drive) with the songs behind each difference, songs the NAS
+doesn't have, how much will be copied vs the free space, Export with progress,
+Eject and Format. Playlist paths like `Z:\data\Artist\Album\song.m4a` are mapped with
 `PATH_MAP` (`Z:\=/mnt/music`), case differences are tolerated. Settings live in
 `/etc/usb-exporter.env` in the container; host settings in `/etc/usb-exporter/host.conf`.
 
@@ -113,8 +134,8 @@ Other folders on the drive (e.g. a Rekordbox `Contents/`) are never touched.
 
 ## Open items
 
-- The Proxmox installer and the host-side USB mount/propagation are untested on
-  the real server (written 2026-10-18 without host access). The web app and the
+- Format is untested on real hardware (written 2026-10-24); install, USB mount,
+  propagation and Eject were verified on pve (CT 116, Lexar on the front port). The web app and the
   M3U reader were tested against the real NAS playlists (10 playlists, all songs found).
 - Windows GUI: iTunes needs the NAS songs in its library before they can be in playlists.
 
