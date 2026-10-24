@@ -51,22 +51,26 @@ The page's titles use the TAN Spring font if `/etc/usb-exporter/fonts/TAN-SPRING
 exists in the container (Arial otherwise). The font is commercial, so it's not in
 this repo: copy your own licensed file there.
 
-## Export for Mixxx, Traktor or other players
+## Drive layouts: Mixxx or Traktor
 
-Under the playlist table, **Export for** picks the software (several at once;
-remembered per browser). The songs are copied once to `Music/` either way.
+Each drive is in one layout, chosen under the playlist table (**Layout**):
 
-| Target | Written on the drive | Use |
+| Layout | On the drive | Use |
 |---|---|---|
-| Mixxx (Pi) | `Playlists/<name>.m3u8` | the push-mixxx Pi imports them automatically |
-| Traktor | `Traktor/Exporter USB.nml` | Traktor: Playlists > right-click > Import Playlist > this file, once: every playlist arrives in an "Exporter USB" folder |
-| Other players | `M3U/<name>.m3u` | any player or DJ app that imports M3U |
+| Mixxx (Pi) | `Music/Artist/Album/song` + `Playlists/<name>.m3u8` | the push-mixxx Pi imports the playlists automatically |
+| Traktor | one folder per playlist at the drive root, songs directly inside, no playlist files | browse the folders in Traktor's Explorer |
 
-Traktor stores where a song is with the drive's name on macOS and its letter on
-Windows, so pick **on Mac** or **on Windows, drive E** (the letter the stick gets
-on that PC). BPM, grids and cues analysed in Traktor stay in Traktor's own
-collection on the laptop. The "on drive" states on the page compare against the
-Mixxx playlists. Command line: `--for mixxx,traktor,m3u --traktor-os windows --traktor-drive E`.
+Switching a drive to the other layout **moves** the files already on it (a
+rename on the drive, nothing downloaded again); only songs it doesn't have yet,
+and extra copies of a song that is in several playlists (Traktor: each folder
+is complete), are copied. Songs no ticked playlist uses go to `Unsorted/`
+(Traktor) or stay in `Music/` (Mixxx); "Delete songs no playlist uses" deletes
+them instead. In the Traktor layout, folders of playlists you didn't tick are
+left as they are unless "Remove playlists ... not ticked" is on.
+
+`.exporter/manifest.json` on the drive records which song every file is, so
+in sync / differs work in both layouts and files can be moved instead of
+re-copied. Command line: `--layout mixxx|traktor`.
 
 ## Repos, releases and auto-deploy
 

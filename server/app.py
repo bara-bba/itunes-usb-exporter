@@ -76,21 +76,22 @@ def state():
     drive = drive_info()
     mounted = drive['state'] == 'mounted'
     usb = CFG['USB_ROOT']
-    on_drive = ex.drive_playlists(usb) if mounted else {}
+    layout = ex.drive_layout(usb) if mounted else None
+    drive['layout'] = layout
+    on_drive = ex.drive_state(usb) if mounted else {}
     rows, names = [], set()
     for p in load():
         names.add(p.name)
-        st, detail = ex.compare(p, on_drive.get(p.name), usb) if mounted else ('', '')
-        want = [s.line for s in p.songs]
-        have = on_drive.get(p.name) or []
-        key = os.path.normcase
-        have_k, want_k = {key(x) for x in have}, {key(x) for x in want}
-        song_name = lambda line: os.path.splitext(line.rsplit('/', 1)[-1])[0]
+        have = on_drive.get(p.name)
+        st, detail = ex.compare_rels(p, have) if mounted else ('', '')
+        key = ex._norm
+        want_k, have_k = {key(s.rel) for s in p.songs}, {key(r) for r in (have or []) if r}
+        song_name = lambda rel: os.path.splitext(rel.replace(os.sep, '/').rsplit('/', 1)[-1])[0]
         rows.append({'name': p.name, 'songs': len(p.songs), 'missing': p.missing[:50],
-                     'to_add': [song_name(x) for x in want if key(x) not in have_k][:50],
-                     'only_drive': [song_name(x) for x in have if key(x) not in want_k][:50],
+                     'to_add': [song_name(s.rel) for s in p.songs if key(s.rel) not in have_k][:50],
+                     'only_drive': [song_name(r) for r in (have or []) if r and key(r) not in want_k][:50],
                      'missing_count': len(p.missing), 'state': st, 'detail': detail})
-    extra = [{'name': n, 'songs': len(lines)} for n, lines in on_drive.items() if n not in names]
+    extra = [{'name': n, 'songs': len(rels)} for n, rels in on_drive.items() if n not in names]
     with job_lock:
         j = dict(job, log=job['log'][-200:])
     return {'drive': drive, 'playlists': rows, 'only_on_drive': extra, 'job': j,
@@ -111,7 +112,7 @@ VERSION = git_version()
 last_export = None  # {'at': iso time, 'summary': ..., 'ok': bool}
 
 
-def run_export(names, remove_others, prune, targets, traktor_platform, traktor_letter):
+def run_export(names, remove_others, prune, layout):
     def log(msg):
         with job_lock:
             job['log'].append(msg)
@@ -123,8 +124,7 @@ def run_export(names, remove_others, prune, targets, traktor_platform, traktor_l
     try:
         chosen = [p for p in load() if p.name in names]
         summary = ex.export(CFG['USB_ROOT'], chosen, remove_others=remove_others, prune=prune,
-                            log=log, progress=progress, targets=targets, traktor_platform=traktor_platform,
-                            traktor_letter=traktor_letter, label=drive_info().get('label', ''))
+                            log=log, progress=progress, layout=layout)
         getattr(os, "sync", lambda: None)()
         with job_lock:
             job['summary'] = summary
@@ -184,12 +184,12 @@ def format_drive(fstype, label, confirm):
     return 504, {'error': 'the host did not finish formatting - is usb-exporter-format.path running on Proxmox?'}
 
 
-def estimate(names):
+def estimate(names, layout=None):
     usb = CFG['USB_ROOT']
     if drive_info()['state'] != 'mounted':
         return {'bytes': 0}
     chosen = [p for p in load() if p.name in names]
-    return {'bytes': ex.bytes_to_copy(usb, chosen)}
+    return {'bytes': ex.bytes_to_copy(usb, chosen, layout if layout in ex.LAYOUTS else None)}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -245,9 +245,8 @@ class Handler(BaseHTTPRequestHandler):
                 job.update(running=True, done=0, total=0, log=[], summary='', error='')
             threading.Thread(target=run_export, daemon=True,
                              args=(set(body.get('names', [])), bool(body.get('remove_others')),
-                                   bool(body.get('prune')), list(body.get('targets') or ['mixxx']),
-                                   str(body.get('traktor_platform') or 'mac'),
-                                   str(body.get('traktor_letter') or ''))).start()
+                                   bool(body.get('prune')),
+                                   body.get('layout') if body.get('layout') in ex.LAYOUTS else None)).start()
             return self._send(202, {'started': True})
         if self.path == '/api/eject':
             code, res = eject()
@@ -256,7 +255,7 @@ class Handler(BaseHTTPRequestHandler):
             code, res = format_drive(body.get('fstype'), str(body.get('label') or ''), body.get('confirm'))
             return self._send(code, res)
         if self.path == '/api/estimate':
-            return self._send(200, estimate(set(body.get('names', []))))
+            return self._send(200, estimate(set(body.get('names', [])), body.get('layout')))
         self._send(404, {'error': 'not found'})
 
 

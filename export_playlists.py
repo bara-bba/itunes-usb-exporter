@@ -245,46 +245,6 @@ def compare(playlist, drive_lines, drive):
     return ('differs', ', '.join(parts)) if parts else ('in sync', '')
 
 
-def bytes_to_copy(drive, playlists):
-    total, seen = 0, set()
-    for pl in playlists:
-        for s in pl.songs:
-            key = os.path.normcase(s.rel)
-            if key in seen:
-                continue
-            seen.add(key)
-            dst = os.path.join(drive, MUSIC_DIR, s.rel)
-            size = os.path.getsize(s.src)
-            if not (os.path.isfile(dst) and os.path.getsize(dst) == size):
-                total += size
-    return total
-
-
-TARGETS = ('mixxx', 'traktor', 'm3u')
-GENERIC_DIR = 'M3U'                 # generic .m3u playlists (any player)
-TRAKTOR_DIR = 'Traktor'             # one .nml with every exported playlist
-TRAKTOR_FILE = 'Exporter USB.nml'
-TRAKTOR_FOLDER = 'Exporter USB'     # playlist folder Traktor shows after the import
-
-
-def _copy_songs(drive, playlists, log, progress):
-    music_root = os.path.join(drive, MUSIC_DIR)
-    total = sum(len(pl.songs) for pl in playlists)
-    done = copied = 0
-    for pl in playlists:
-        for s in pl.songs:
-            dst = os.path.join(music_root, s.rel)
-            if not (os.path.isfile(dst) and os.path.getsize(dst) == os.path.getsize(s.src)):
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                log(f'copy  {s.rel}')
-                shutil.copyfile(s.src, dst)
-                copied += 1
-            done += 1
-            if progress:
-                progress(done, total)
-    return copied
-
-
 def _write_m3u_dir(drive, playlists, folder, ext, remove_others, log):
     """Playlists as .m3u8 (Mixxx) or .m3u (generic), paths relative to the playlist file."""
     root = os.path.join(drive, folder)
@@ -309,104 +269,313 @@ def _write_m3u_dir(drive, playlists, folder, ext, remove_others, log):
     return removed
 
 
-def _xml(s):
-    return (str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            .replace('"', '&quot;'))
+LAYOUTS = ('mixxx', 'traktor')
+META_DIR = '.exporter'              # on the drive: manifest + staging area
+MANIFEST = 'manifest.json'
+UNSORTED_DIR = 'Unsorted'           # songs no ticked playlist uses any more
+# Never used as a Traktor playlist folder name (they'd clash with other things on the drive).
+RESERVED = {MUSIC_DIR, PLAYLIST_DIR, UNSORTED_DIR, META_DIR, '.mixxx', 'PIONEER', 'Contents',
+            'System Volume Information', 'Traktor', 'M3U'}
 
 
-def traktor_volume(platform, label, letter=''):
-    """How Traktor names the drive in its paths: the drive letter on Windows
-    ('E:'), the volume name on macOS."""
-    if platform == 'windows':
-        letter = (letter or 'E').strip().rstrip(':\\/').upper()[:1] or 'E'
-        return letter + ':'
-    return label or 'USB'
+def _norm(p):
+    return os.path.normcase(p.replace('\\', '/'))
 
 
-def write_traktor_nml(drive, playlists, volume):
-    """One Traktor .nml holding every playlist in a folder: in Traktor,
-    Playlists > Import Playlist > this file brings them all in at once."""
-    import uuid
-    entries, keys = {}, []
-    for pl in playlists:
-        pk = []
-        for s in pl.songs:
-            parts = [MUSIC_DIR] + s.rel.replace('\\', '/').split('/')
-            d = '/:' + '/:'.join(parts[:-1]) + '/:'
-            key = volume + d + parts[-1]
-            if key not in entries:
-                info = s.extinf.split(',', 1)[1] if ',' in s.extinf else parts[-1]
-                artist, _, title = info.partition(' - ') if ' - ' in info else ('', '', info)
-                entries[key] = (f'<ENTRY TITLE="{_xml(title)}" ARTIST="{_xml(artist)}">'
-                                f'<LOCATION DIR="{_xml(d)}" FILE="{_xml(parts[-1])}" VOLUME="{_xml(volume)}" '
-                                f'VOLUMEID="{_xml(volume)}"></LOCATION></ENTRY>')
-            pk.append(key)
-        keys.append((pl.name, pk))
-    nodes = ''.join(
-        f'<NODE TYPE="PLAYLIST" NAME="{_xml(name)}"><PLAYLIST ENTRIES="{len(pk)}" TYPE="LIST" UUID="{uuid.uuid4().hex}">'
-        + ''.join(f'<ENTRY><PRIMARYKEY TYPE="TRACK" KEY="{_xml(k)}"></PRIMARYKEY></ENTRY>' for k in pk)
-        + '</PLAYLIST></NODE>' for name, pk in keys)
-    nml = ('<?xml version="1.0" encoding="UTF-8" standalone="no" ?>\n'
-           '<NML VERSION="19"><HEAD COMPANY="www.native-instruments.com" PROGRAM="Traktor"></HEAD>'
-           f'<COLLECTION ENTRIES="{len(entries)}">' + ''.join(entries.values()) + '</COLLECTION>'
-           '<PLAYLISTS><NODE TYPE="FOLDER" NAME="$ROOT"><SUBNODES COUNT="1">'
-           f'<NODE TYPE="FOLDER" NAME="{_xml(TRAKTOR_FOLDER)}"><SUBNODES COUNT="{len(keys)}">{nodes}</SUBNODES></NODE>'
-           '</SUBNODES></NODE></PLAYLISTS></NML>\n')
-    root = os.path.join(drive, TRAKTOR_DIR)
-    os.makedirs(root, exist_ok=True)
-    with open(os.path.join(root, TRAKTOR_FILE), 'w', encoding='utf-8', newline='\n') as f:
-        f.write(nml)
+def load_manifest(drive):
+    import json
+    try:
+        with open(os.path.join(drive, META_DIR, MANIFEST), encoding='utf-8') as f:
+            m = json.load(f)
+    except (OSError, ValueError):
+        m = {}
+    m.setdefault('files', {})       # drive path -> {"rel": path under the NAS songs folder, "size": bytes}
+    m.setdefault('playlists', {})   # Traktor layout: playlist name -> [drive paths]
+    return m
 
 
-def export(drive, playlists, remove_others=False, prune=False, log=print, progress=None,
-           targets=('mixxx',), traktor_platform='mac', traktor_letter='', label=''):
-    """Copies the songs of `playlists` to <drive>/Music once, then writes them for
-    each target: mixxx = Playlists/*.m3u8 (the Pi imports them), traktor = one
-    Traktor/Exporter USB.nml, m3u = M3U/*.m3u for any other player.
-    remove_others: delete .m3u8/.m3u playlist files not in `playlists`.
-    prune: delete songs under Music/ that no playlist left on the drive uses.
-    progress(done, total) is called after each song. Returns a summary string."""
-    targets = [t for t in TARGETS if t in set(targets)] or ['mixxx']
-    need = bytes_to_copy(drive, playlists)
+def save_manifest(drive, m):
+    import json
+    os.makedirs(os.path.join(drive, META_DIR), exist_ok=True)
+    tmp = os.path.join(drive, META_DIR, MANIFEST + '.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(m, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, os.path.join(drive, META_DIR, MANIFEST))
+
+
+def drive_layout(drive):
+    """'traktor', 'mixxx' or None (empty / foreign drive)."""
+    m = load_manifest(drive)
+    if m.get('layout') in LAYOUTS:
+        return m['layout']
+    if os.path.isdir(os.path.join(drive, PLAYLIST_DIR)) or os.path.isdir(os.path.join(drive, MUSIC_DIR)):
+        return 'mixxx'
+    return None
+
+
+def folder_name(playlist_name):
+    name = clean(playlist_name, 'Playlist')
+    return name + ' (playlist)' if name in RESERVED or name.startswith('.') else name
+
+
+def drive_state(drive):
+    """{playlist name: [song rels]} as the drive has them now, whatever its layout."""
+    layout = drive_layout(drive)
+    if layout == 'traktor':
+        m = load_manifest(drive)
+        out = {}
+        for name, paths in m['playlists'].items():
+            out[name] = [m['files'][p]['rel'] if p in m['files'] and os.path.isfile(os.path.join(drive, p)) else None
+                         for p in paths]
+        return out
+    prefix = '../' + MUSIC_DIR + '/'
+    out = {}
+    for name, lines in drive_playlists(drive).items():
+        out[name] = [l[len(prefix):] if l.startswith(prefix) and os.path.isfile(line_to_file(drive, l)) else None
+                     for l in lines]
+    return out
+
+
+def compare_rels(playlist, have):
+    """Like compare(), on song rels: have = list of rels (None = file missing) or None."""
+    if have is None:
+        return 'not on drive', ''
+    want = [_norm(s.rel) for s in playlist.songs]
+    got = [_norm(r) for r in have if r]
+    added, removed = len(set(want) - set(got)), len(set(got) - set(want))
+    missing = sum(1 for r in have if r is None)
+    parts = []
+    if added:
+        parts.append(f'+{added} on the NAS')
+    if removed:
+        parts.append(f'-{removed} only on drive')
+    if missing:
+        parts.append(f'{missing} songs missing on drive')
+    return ('differs', ', '.join(parts)) if parts else ('in sync', '')
+
+
+def _scan_pool(drive, m):
+    """Files on the drive whose source song we know: drive path -> rel."""
+    pool = {}
+    for p, info in m['files'].items():
+        full = os.path.join(drive, p)
+        if os.path.isfile(full) and os.path.getsize(full) == info.get('size', -1):
+            pool[p] = info['rel']
+    music = os.path.join(drive, MUSIC_DIR)
+    for dirpath, _, files in os.walk(music):
+        for f in files:
+            rel = os.path.relpath(os.path.join(dirpath, f), music).replace('\\', '/')
+            pool.setdefault(MUSIC_DIR + '/' + rel, rel)
+    return pool
+
+
+def plan(drive, playlists, layout, remove_others=False, prune=False):
+    """What arranging `playlists` onto `drive` in `layout` takes, without touching anything.
+    Returns a dict: keep / move [(from, to)] / copy_drive [(from, to)] / copy_nas [(Song, to)] /
+    leftovers [(from, to or None=delete)], desired {path: rel}, playlists {name: [paths]}, bytes."""
+    m = load_manifest(drive)
+    pool = _scan_pool(drive, m)
+    desired, pl_paths = {}, {}
+    if layout == 'mixxx':
+        for pl in playlists:
+            for s in pl.songs:
+                desired[MUSIC_DIR + '/' + s.rel.replace('\\', '/')] = s
+    else:
+        for pl in playlists:
+            folder, used, paths = folder_name(pl.name), set(), []
+            for s in pl.songs:
+                base, ext = os.path.splitext(os.path.basename(s.rel))
+                name, n = base + ext, 2
+                while _norm(name) in used:  # two different songs with the same file name
+                    name, n = f'{base} ({n}){ext}', n + 1
+                used.add(_norm(name))
+                paths.append(f'{folder}/{name}')
+                desired[f'{folder}/{name}'] = s
+            pl_paths[pl.name] = paths
+
+    # Traktor folders of playlists not exported now stay as they are (unless remove_others)
+    protected = {}
+    if layout == 'traktor' and m.get('layout') == 'traktor' and not remove_others:
+        chosen = {pl.name for pl in playlists}
+        for name, paths in m['playlists'].items():
+            if name not in chosen:
+                kept = [p for p in paths if p in pool]
+                if kept:
+                    pl_paths[name] = kept
+                    protected.update({p: pool[p] for p in kept})
+
+    by_rel = {}
+    for p, rel in pool.items():
+        by_rel.setdefault(_norm(rel), []).append(p)
+    used = set(protected)
+    keep, move, copy_drive, copy_nas, placed = [], [], [], [], {}
+    for dst, s in desired.items():          # already in place
+        if pool.get(dst) is not None and _norm(pool[dst]) == _norm(s.rel):
+            keep.append(dst)
+            used.add(dst)
+            placed.setdefault(_norm(s.rel), dst)
+    for dst, s in desired.items():
+        if dst in used and dst in keep:
+            continue
+        r = _norm(s.rel)
+        free = [p for p in by_rel.get(r, []) if p not in used and p not in desired]
+        if free:
+            move.append((free[0], dst))
+            used.add(free[0])
+            placed.setdefault(r, dst)
+        elif r in placed:
+            copy_drive.append((placed[r], dst))
+        else:
+            copy_nas.append((s, dst))
+            placed[r] = dst
+
+    leftovers, unsorted_names = [], set()
+    targets = set(desired) | set(protected)
+    for p, rel in pool.items():
+        if p in used or p in targets:
+            continue
+        if prune:
+            leftovers.append((p, None))
+        elif layout == 'mixxx':
+            dst = MUSIC_DIR + '/' + rel
+            if dst in targets or _norm(dst) in unsorted_names:  # an extra copy of a song already in place
+                leftovers.append((p, None))
+            else:
+                leftovers.append((p, dst))
+                unsorted_names.add(_norm(dst))
+        else:
+            if p.startswith(UNSORTED_DIR + '/'):
+                leftovers.append((p, p))
+                unsorted_names.add(_norm(p))
+                continue
+            base, ext = os.path.splitext(os.path.basename(p))
+            name, n = base + ext, 2
+            while _norm(f'{UNSORTED_DIR}/{name}') in unsorted_names:
+                name, n = f'{base} ({n}){ext}', n + 1
+            unsorted_names.add(_norm(f'{UNSORTED_DIR}/{name}'))
+            leftovers.append((p, f'{UNSORTED_DIR}/{name}'))
+
+    size = lambda p: os.path.getsize(os.path.join(drive, p))
+    nbytes = sum(os.path.getsize(s.src) for s, _ in copy_nas) + sum(size(a) for a, _ in copy_drive if a in pool)
+    nbytes += sum(os.path.getsize(desired[a].src) for a, _ in copy_drive if a not in pool)
+    return {'keep': keep, 'move': move, 'copy_drive': copy_drive, 'copy_nas': copy_nas,
+            'leftovers': leftovers, 'desired': {p: s.rel for p, s in desired.items()},
+            'protected': protected, 'playlists': pl_paths, 'bytes': nbytes, 'pool': pool}
+
+
+def bytes_to_copy(drive, playlists, layout=None):
+    return plan(drive, playlists, layout or drive_layout(drive) or 'mixxx')['bytes']
+
+
+def _remove_empty_dirs(root, stop):
+    for dirpath, _, _ in sorted(os.walk(root, topdown=False), key=lambda t: -len(t[0])):
+        if os.path.abspath(dirpath) != os.path.abspath(stop) and not os.listdir(dirpath):
+            os.rmdir(dirpath)
+
+
+def export(drive, playlists, remove_others=False, prune=False, log=print, progress=None, layout=None):
+    """Arranges `playlists` on `drive` in a layout:
+      mixxx   = Music/<Artist/Album/file> + Playlists/<name>.m3u8 (the Pi imports them)
+      traktor = one folder per playlist with the songs inside, no playlist files.
+    Files already on the drive are moved (renamed), not copied again; only songs the
+    drive doesn't have, or extra copies of a song in several playlists, are copied.
+    Songs no exported playlist uses go to Unsorted/ (Traktor) or stay in Music/ (Mixxx),
+    or are deleted with prune. remove_others: also dissolve playlists not exported now.
+    progress(done, total) is called per file. Returns a summary string."""
+    layout = layout or drive_layout(drive) or 'mixxx'
+    p = plan(drive, playlists, layout, remove_others, prune)
     free = shutil.disk_usage(drive).free
-    if need > free:
-        raise OSError(f'not enough space on {drive}: needs {need >> 20} MB, {free >> 20} MB free')
+    if p['bytes'] > free:
+        raise OSError(f'not enough space on {drive}: needs {p["bytes"] >> 20} MB, {free >> 20} MB free')
+    j = lambda rel: os.path.join(drive, rel)
+    total = (len(p['move']) + len(p['copy_drive']) + len(p['copy_nas'])
+             + sum(1 for a, b in p['leftovers'] if a != b))
+    done = 0
 
-    copied = _copy_songs(drive, playlists, log, progress)
+    def step():
+        nonlocal done
+        done += 1
+        if progress:
+            progress(done, total)
+
+    # 1. everything that changes place goes to a staging area first, so a file can
+    #    land where another one is about to leave
+    stage = os.path.join(drive, META_DIR, 'staging')
+    os.makedirs(stage, exist_ok=True)
+    staged = []
+    for i, (src, dst) in enumerate(p['move'] + [(a, b) for a, b in p['leftovers'] if b and a != b]):
+        tmp = os.path.join(stage, str(i))
+        os.replace(j(src), tmp)
+        staged.append((tmp, dst))
+    for src, dst in p['leftovers']:
+        if dst is None:
+            log(f'delete  {src}')
+            os.remove(j(src))
+            step()
+    # anything else sitting where a song must go (not a song we know) is moved aside
+    for dst in list(p['desired']):
+        if os.path.exists(j(dst)) and dst not in p['keep']:
+            aside = f'{UNSORTED_DIR}/{os.path.basename(dst)}'
+            os.makedirs(os.path.dirname(j(aside)), exist_ok=True)
+            os.replace(j(dst), j(aside))
+    # 2. put the staged files in place
+    for tmp, dst in staged:
+        os.makedirs(os.path.dirname(j(dst)), exist_ok=True)
+        os.replace(tmp, j(dst))
+        log(f'move  {dst}')
+        step()
+    # 3. copies: from the NAS, then extra copies from the drive itself
+    for s, dst in p['copy_nas']:
+        os.makedirs(os.path.dirname(j(dst)), exist_ok=True)
+        log(f'copy  {dst}')
+        shutil.copyfile(s.src, j(dst))
+        step()
+    for src, dst in p['copy_drive']:
+        os.makedirs(os.path.dirname(j(dst)), exist_ok=True)
+        log(f'copy  {dst}  (from the drive)')
+        shutil.copyfile(j(src), j(dst))
+        step()
+
+    # 4. playlist files and bookkeeping
+    m = load_manifest(drive)
+    files = {}
+    for path, rel in list(p['desired'].items()) + list(p['protected'].items()):
+        files[path] = {'rel': rel.replace('\\', '/'), 'size': os.path.getsize(j(path))}
+    for src, dst in p['leftovers']:
+        if dst:
+            files[dst] = {'rel': p['pool'][src], 'size': os.path.getsize(j(dst))}
     removed = 0
-    if 'mixxx' in targets:
-        removed += _write_m3u_dir(drive, playlists, PLAYLIST_DIR, '.m3u8', remove_others, log)
-        log(f'Mixxx: {len(playlists)} playlists in {PLAYLIST_DIR}/')
-    if 'm3u' in targets:
-        removed += _write_m3u_dir(drive, playlists, GENERIC_DIR, '.m3u', remove_others, log)
-        log(f'M3U: {len(playlists)} playlists in {GENERIC_DIR}/')
-    if 'traktor' in targets:
-        vol = traktor_volume(traktor_platform, label, traktor_letter)
-        write_traktor_nml(drive, playlists, vol)
-        log(f'Traktor: {TRAKTOR_DIR}/{TRAKTOR_FILE} ({len(playlists)} playlists, drive "{vol}")')
+    if layout == 'mixxx':
+        removed = _write_m3u_dir(drive, playlists, PLAYLIST_DIR, '.m3u8', remove_others, log)
+        m['playlists'] = {}
+    else:
+        pl_dir = os.path.join(drive, PLAYLIST_DIR)
+        if os.path.isdir(pl_dir):  # the Traktor layout has no playlist files
+            for f in os.listdir(pl_dir):
+                if f.lower().endswith(PLAYLIST_EXT):
+                    os.remove(os.path.join(pl_dir, f))
+        removed = len([n for n in m['playlists'] if n not in p['playlists']])
+        m['playlists'] = p['playlists']
+    for old in ('Traktor/Exporter USB.nml',):  # written by v0.5.0
+        if os.path.isfile(j(old)):
+            os.remove(j(old))
+    m.update(layout=layout, files=files)
+    save_manifest(drive, m)
+    for d in [MUSIC_DIR, PLAYLIST_DIR, 'Traktor', 'M3U', UNSORTED_DIR] + [folder_name(n) for n in p['playlists']] \
+            + sorted({x.split('/')[0] for x, _ in p['move'] + p['leftovers'] if '/' in x}):
+        if os.path.isdir(j(d)):
+            _remove_empty_dirs(j(d), drive)
+    _remove_empty_dirs(stage, os.path.join(drive, META_DIR))
 
-    pruned = 0
-    music_root = os.path.join(drive, MUSIC_DIR)
-    if prune and os.path.isdir(music_root):
-        used = {os.path.normcase(os.path.join(music_root, s.rel)) for pl in playlists for s in pl.songs}
-        for folder in (PLAYLIST_DIR, GENERIC_DIR):
-            for lines in drive_playlists(drive, folder).values():
-                used |= {os.path.normcase(os.path.normpath(os.path.join(drive, folder, l))) for l in lines}
-        for dirpath, _, files in os.walk(music_root, topdown=False):
-            for f in files:
-                path = os.path.join(dirpath, f)
-                if os.path.normcase(os.path.normpath(path)) not in used:
-                    os.remove(path)
-                    pruned += 1
-            if dirpath != music_root and not os.listdir(dirpath):
-                os.rmdir(dirpath)
-
-    names = {'mixxx': 'Mixxx', 'traktor': 'Traktor', 'm3u': 'M3U'}
-    summary = f'{len(playlists)} playlists for {" + ".join(names[t] for t in targets)}, {copied} songs copied'
+    summary = (f'{len(playlists)} playlists ({layout}): {len(p["copy_nas"])} copied from the NAS, '
+               f'{len(p["move"])} moved, {len(p["copy_drive"])} duplicated')
+    left = [d for _, d in p['leftovers'] if d and d.startswith(UNSORTED_DIR + '/')]
+    if left:
+        summary += f', {len(left)} in {UNSORTED_DIR}/'
+    if prune:
+        summary += f', {sum(1 for _, d in p["leftovers"] if d is None)} deleted'
     if remove_others:
         summary += f', {removed} playlists removed'
-    if prune:
-        summary += f', {pruned} unused songs deleted'
     return summary
 
 
@@ -419,11 +588,9 @@ def main():
     ap.add_argument('--playlist', action='append', help='export only this playlist (repeatable)')
     ap.add_argument('--list', action='store_true', help='list your playlists and exit')
     ap.add_argument('--prune', action='store_true', help='delete songs under Music/ no playlist uses')
-    ap.add_argument('--for', dest='targets', default='mixxx',
-                    help='comma-separated software to export for: mixxx (default), traktor, m3u')
-    ap.add_argument('--traktor-os', choices=('mac', 'windows'), default='mac',
-                    help='Traktor runs on mac (drive found by name) or windows (by drive letter)')
-    ap.add_argument('--traktor-drive', default='', help='Traktor on Windows: the drive letter, e.g. E')
+    ap.add_argument('--layout', choices=LAYOUTS,
+                    help="mixxx: Music/ + Playlists/*.m3u8; traktor: a folder per playlist "
+                         "(default: the drive's current layout, else mixxx)")
     args = ap.parse_args()
 
     playlists = load_playlists(args.library, args.source_root)
@@ -446,10 +613,7 @@ def main():
             print('\npass the USB drive root to export, e.g.  python export_playlists.py E:\\')
         return
 
-    label = os.path.basename(os.path.normpath(args.drive)) or ''
-    print(export(args.drive, playlists, remove_others=not args.playlist, prune=args.prune,
-                 targets=[t.strip() for t in args.targets.split(',')], traktor_platform=args.traktor_os,
-                 traktor_letter=args.traktor_drive or args.drive[:1], label=label))
+    print(export(args.drive, playlists, remove_others=not args.playlist, prune=args.prune, layout=args.layout))
     for p in playlists:
         for m in p.missing:
             print(f'WARNING {p.name}: missing on PC: {m}')
