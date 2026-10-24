@@ -16,7 +16,9 @@ standard library only. Configured by environment variables
 """
 import json
 import os
+import mimetypes
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -92,7 +94,21 @@ def state():
     with job_lock:
         j = dict(job, log=job['log'][-200:])
     return {'drive': drive, 'playlists': rows, 'only_on_drive': extra, 'job': j,
-            'source': CFG['PLAYLIST_DIR']}
+            'source': CFG['PLAYLIST_DIR'], 'songs_root': CFG['SOURCE_ROOT'], 'usb_root': usb,
+            'version': VERSION, 'last_export': last_export}
+
+
+def git_version():
+    try:
+        out = subprocess.run(['git', '-C', os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              'describe', '--tags', '--always'], capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or 'dev'
+    except (OSError, subprocess.SubprocessError):
+        return 'dev'
+
+
+VERSION = git_version()
+last_export = None  # {'at': iso time, 'summary': ..., 'ok': bool}
 
 
 def run_export(names, remove_others, prune):
@@ -117,8 +133,11 @@ def run_export(names, remove_others, prune):
             job['error'] = str(e)
         log(f'FAILED: {e}')
     finally:
+        global last_export
         with job_lock:
             job['running'] = False
+            last_export = {'at': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'summary': job['summary'] or job['error'],
+                           'ok': not job['error']}
 
 
 def eject():
@@ -194,6 +213,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == '/api/job':
             with job_lock:
                 return self._send(200, dict(job, log=job['log'][-200:]))
+        if self.path.startswith('/static/') or self.path == '/favicon.ico':
+            rel = 'favicon.ico' if self.path == '/favicon.ico' else self.path[len('/static/'):]
+            path = os.path.normpath(os.path.join(STATIC, rel))
+            if path.startswith(STATIC + os.sep) and os.path.isfile(path):
+                ctype = {'.webmanifest': 'application/manifest+json', '.woff2': 'font/woff2',
+                         '.svg': 'image/svg+xml'}.get(os.path.splitext(path)[1]) \
+                    or mimetypes.guess_type(path)[0] or 'application/octet-stream'
+                with open(path, 'rb') as f:
+                    return self._send(200, f.read(), ctype)
         if self.path.startswith('/fonts/'):
             path = os.path.join(CFG['FONT_DIR'], os.path.basename(self.path))
             if os.path.isfile(path):

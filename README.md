@@ -68,7 +68,8 @@ Why the host mounts the drive: an unprivileged container may use a block device
 but the kernel won't let it mount one. Passing the device in and mounting it with
 FUSE works for exFAT/NTFS but not reliably for FAT32, the usual format.
 
-The page (open `http://<container-ip>:8080`, also from a phone) shows each NAS
+The page (open `http://<container-ip>:8080`, also from a phone; installable as an
+app, same look and nav bar as music-sync: Playlists / Drive / System) shows each NAS
 playlist with its state on the plugged-in drive (in sync / differs / not on
 drive / only on drive) with the songs behind each difference, songs the NAS
 doesn't have, how much will be copied vs the free space, Export with progress,
