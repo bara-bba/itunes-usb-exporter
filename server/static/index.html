@@ -158,7 +158,7 @@
 <script>
 const $ = id => document.getElementById(id);
 let data = null, selected = new Set(), preselected = false, wasMounted = false, open = new Set();
-let filter = 'all', search = '', estimate = null, estTimer = null, polling = false;
+let filter = 'all', search = '', estimate = null, estTimer = null, polling = false, notice = null;
 // layout to export in: the drive's own unless changed here
 let chosenLayout = null;
 const LAYOUT_NAMES = {mixxx: 'Mixxx', traktor: 'Traktor'};
@@ -181,6 +181,9 @@ function ago(iso) {
 }
 async function api(path, body) {
   const r = await fetch(path, body === undefined ? {} : {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  // behind the proxy an expired login answers with the login page (HTML), not with data
+  if (!(r.headers.get('Content-Type') || '').includes('json') || r.redirected)
+    throw new Error('Unexpected reply from the server - reload the page (login expired?)');
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
@@ -198,9 +201,10 @@ function renderChrome() {
   $('export').textContent = j.running ? `Exporting ${j.done} / ${j.total}` : 'Export';
   $('bar').style.width = j.running && j.total ? (100 * j.done / j.total) + '%' : '0';
   const jl = $('jobline');
-  jl.classList.toggle('show', !!(j.running || j.error));
-  jl.innerHTML = j.running ? `Exporting to ${esc(d.label || 'the drive')}: ${j.done} of ${j.total} songs &middot; ${esc(j.log[j.log.length - 1] || '')}`
-               : j.error ? `<span class="err">Export failed: ${esc(j.error)}</span>` : '';
+  jl.classList.toggle('show', !!(j.running || j.error || notice));
+  jl.innerHTML = j.running ? (j.total ? `Exporting to ${esc(d.label || 'the drive')}: ${j.done} of ${j.total} files &middot; ${esc(j.log[j.log.length - 1] || '')}`
+                                      : `Exporting to ${esc(d.label || 'the drive')}: checking what's already there&hellip;`)
+               : j.error ? `<span class="err">Export failed: ${esc(j.error)}</span>` : notice ? `<span class="ok">${esc(notice)}</span>` : '';
 
   const pl = data.playlists, sync = pl.filter(p => p.state === 'in sync').length;
   const used = d.total ? d.total - d.free : 0;
@@ -356,10 +360,14 @@ $('export').onclick = async () => {
   const cur = data.drive.layout;
   if (cur && cur !== layoutNow() && !confirm(`Rearrange "${data.drive.label || 'the drive'}" from the ${LAYOUT_NAMES[cur]} to the ${LAYOUT_NAMES[layoutNow()]} layout?\n\nFiles already on the drive are moved, not downloaded again. Songs no ticked playlist uses go to the Unsorted folder${layoutNow() === 'mixxx' ? ' (Music/ for Mixxx)' : ''}.`)) return;
   try {
+    notice = null;
+    $('export').disabled = true; $('export').textContent = 'Starting…';
     await api('/api/export', {names: [...selected], remove_others: remove, prune, layout: layoutNow()});
+    data.job = Object.assign(data.job, {running: true, done: 0, total: 0, error: '', log: []});
+    renderChrome();
     watchJob();
   }
-  catch (e) { alert(e.message); }
+  catch (e) { alert(e.message); refresh(); }
 };
 
 async function eject() {
@@ -396,6 +404,12 @@ async function watchJob() {
       await new Promise(r => setTimeout(r, 500));
     }
   } finally { polling = false; }
+  const j = data.job;
+  if (!j.error && j.summary) {
+    notice = /0 copied from the NAS, 0 moved, 0 duplicated/.test(j.summary) && !/deleted|Unsorted|removed/.test(j.summary)
+      ? 'Already up to date: everything ticked is on the drive.' : 'Done: ' + j.summary;
+    setTimeout(() => { notice = null; renderChrome(); }, 15000);
+  }
   refresh();
 }
 
