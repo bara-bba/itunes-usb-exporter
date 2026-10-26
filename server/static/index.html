@@ -120,6 +120,13 @@
   pre { background: var(--panel); color: var(--dim); border: 1px solid var(--hair); padding: 8px 10px; height: 260px; overflow: auto; margin: 0;
         font: 12px var(--mono); white-space: pre-wrap; }
   .empty { padding: 30px 16px; color: var(--dim); text-align: center; }
+  /* in-page dialogs (browsers can silently block confirm/alert/prompt) */
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: flex; align-items: center; justify-content: center; z-index: 20; padding: 16px; }
+  .modal .dlg { background: var(--ink); border: 1px solid var(--edge); max-width: 460px; width: 100%; padding: 18px; }
+  .modal .dlg h3 { margin: 0 0 10px; font: normal 20px var(--display); color: var(--lime); }
+  .modal .dlg.danger h3 { color: var(--red); }
+  .modal .dlg p { margin: 0 0 12px; white-space: pre-line; color: var(--line); font-size: 13px; }
+  .modal .dlg .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
 
   @media (max-width: 860px) {
     :root { --gut: 14px; }
@@ -188,6 +195,27 @@ async function api(path, body) {
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
 }
+// dlg(title, text, {ok, cancel, danger, input}) -> Promise: true/false, or the typed text (null = cancelled)
+function dlg(title, text, o = {}) {
+  return new Promise(resolve => {
+    const m = document.createElement('div');
+    m.className = 'modal';
+    m.innerHTML = `<div class="dlg${o.danger ? ' danger' : ''}"><h3>${esc(title)}</h3><p>${esc(text)}</p>` +
+      (o.input !== undefined ? `<input type="text" id="dlgin" placeholder="${esc(o.input)}">` : '') +
+      `<div class="row">${o.cancel === false ? '' : `<button id="dlgno">${esc(o.cancel || 'Cancel')}</button>`}` +
+      `<button id="dlgok" class="${o.danger ? 'danger' : 'accent'}">${esc(o.ok || 'OK')}</button></div></div>`;
+    document.body.appendChild(m);
+    const done = v => { m.remove(); resolve(v); };
+    const ok = () => done(o.input !== undefined ? m.querySelector('#dlgin').value : true);
+    m.querySelector('#dlgok').onclick = ok;
+    if (m.querySelector('#dlgno')) m.querySelector('#dlgno').onclick = () => done(o.input !== undefined ? null : false);
+    m.onclick = e => { if (e.target === m) done(o.input !== undefined ? null : false); };
+    const inp = m.querySelector('#dlgin');
+    if (inp) { inp.focus(); inp.onkeydown = e => { if (e.key === 'Enter') ok(); if (e.key === 'Escape') done(null); }; }
+    else m.querySelector('#dlgok').focus();
+  });
+}
+const tell = (title, text) => dlg(title, text, {cancel: false});
 const mounted = () => data && data.drive.state === 'mounted';
 const driveName = d => d.state === 'mounted' ? (d.label || 'USB drive')
   : ({ejected: 'Safe to remove', error: 'Drive not readable', formatting: 'Formatting…'}[d.state] || 'No drive');
@@ -356,9 +384,12 @@ function selectionChanged() {
 $('export').onclick = async () => {
   const remove = $('remove') && $('remove').checked, prune = $('prune') && $('prune').checked;
   const del = [remove && 'playlists that are not ticked', prune && 'songs no playlist uses'].filter(Boolean);
-  if (del.length && !confirm('This will delete ' + del.join(' and ') + ' on the USB drive. Continue?')) return;
+  if (del.length && !await dlg('Delete on the drive?', 'This will delete ' + del.join(' and ') + ' on the USB drive.', {ok: 'Export and delete', danger: true})) return;
   const cur = data.drive.layout;
-  if (cur && cur !== layoutNow() && !confirm(`Rearrange "${data.drive.label || 'the drive'}" from the ${LAYOUT_NAMES[cur]} to the ${LAYOUT_NAMES[layoutNow()]} layout?\n\nFiles already on the drive are moved, not downloaded again. Songs no ticked playlist uses go to the Unsorted folder${layoutNow() === 'mixxx' ? ' (Music/ for Mixxx)' : ''}.`)) return;
+  if (cur && cur !== layoutNow() && !await dlg(`Rearrange ${data.drive.label || 'the drive'}?`,
+      `From the ${LAYOUT_NAMES[cur]} to the ${LAYOUT_NAMES[layoutNow()]} layout.\n\nFiles already on the drive are moved, not downloaded again. ` +
+      (layoutNow() === 'mixxx' ? 'Extra copies of songs that were in several folders are removed.' : 'Songs no ticked playlist uses go to the Unsorted folder.'),
+      {ok: 'Rearrange and export'})) return;
   try {
     notice = null;
     $('export').disabled = true; $('export').textContent = 'Starting…';
@@ -367,22 +398,23 @@ $('export').onclick = async () => {
     renderChrome();
     watchJob();
   }
-  catch (e) { alert(e.message); refresh(); }
+  catch (e) { tell('Export failed', e.message); refresh(); }
 };
 
 async function eject() {
   $('eject').disabled = true; $('eject').textContent = 'Ejecting…';
-  try { await api('/api/eject', {}); } catch (e) { alert(e.message); }
+  try { await api('/api/eject', {}); } catch (e) { tell('Eject failed', e.message); }
   refresh();
 }
 
 async function format() {
   const d = data.drive, label = d.label || 'FORMAT', fs = $('fstype').value, name = $('newlabel').value.trim() || 'MUSIC';
-  const typed = prompt(`This ERASES everything on "${label}" and formats it as ${fs === 'vfat' ? 'FAT32' : 'exFAT'} named "${name}".\n\nType the drive's current name to confirm: ${label}`);
+  const typed = await dlg(`Erase ${label}?`, `This ERASES everything on "${label}" and formats it as ${fs === 'vfat' ? 'FAT32' : 'exFAT'} named "${name}".\n\nType the drive's current name to confirm: ${label}`,
+                          {ok: 'Format', danger: true, input: label});
   if (typed === null) return;
   $('format').disabled = true; $('format').textContent = 'Formatting…';
-  try { const r = await api('/api/format', {fstype: fs, label: name, confirm: typed.trim()}); alert(`Formatted: "${r.label}" (${r.fstype}).`); preselected = false; }
-  catch (e) { alert(e.message); }
+  try { const r = await api('/api/format', {fstype: fs, label: name, confirm: typed.trim()}); tell('Formatted', `"${r.label}" (${r.fstype}) is ready.`); preselected = false; }
+  catch (e) { tell('Format failed', e.message); }
   refresh();
 }
 
