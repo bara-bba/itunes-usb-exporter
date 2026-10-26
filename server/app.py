@@ -206,6 +206,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        self.path = self.path.split('?', 1)[0]  # e.g. /?r=1 from cache-busting links
         if self.path in ('/', '/index.html'):
             with open(os.path.join(STATIC, 'index.html'), 'rb') as f:
                 return self._send(200, f.read(), 'text/html; charset=utf-8')
@@ -231,6 +232,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {'error': 'not found'})
 
     def do_POST(self):
+        self.path = self.path.split('?', 1)[0]
         length = int(self.headers.get('Content-Length') or 0)
         try:
             body = json.loads(self.rfile.read(length) or b'{}')

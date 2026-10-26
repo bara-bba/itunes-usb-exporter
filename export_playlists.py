@@ -357,9 +357,10 @@ def compare_rels(playlist, have):
 def _scan_pool(drive, m):
     """Files on the drive whose source song we know: drive path -> rel."""
     pool = {}
+    # A file at its recorded path is that song even if its size changed: DJ software
+    # (Traktor) writes its analysis into the files' tags. Never replace those.
     for p, info in m['files'].items():
-        full = os.path.join(drive, p)
-        if os.path.isfile(full) and os.path.getsize(full) == info.get('size', -1):
+        if os.path.isfile(os.path.join(drive, p)):
             pool[p] = info['rel']
     music = os.path.join(drive, MUSIC_DIR)
     for dirpath, _, files in os.walk(music):
